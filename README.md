@@ -68,6 +68,31 @@ Mix and match any backend for either role (`anthropic`, `ollama`, `openai`).
 `openai` means **any** OpenAI-compatible endpoint — LM Studio, vLLM,
 llama.cpp, OpenRouter, etc.
 
+## Proof — a real, verified run
+
+Maestro fixing a real bug with **real models**: a 120B cloud model
+(`gpt-oss:120b`) as Supervisor directing a small local model (`qwen3.5`) as
+Executor. The Supervisor planned one step, the local model edited the file, and
+`pytest` went green on the first attempt:
+
+```text
+Supervisor: ollama:gpt-oss:120b-cloud   Executor: ollama:qwen3.5:latest
+
+[SUPERVISOR] planning: Make the failing unit tests pass.
+[SUPERVISOR] 1 step(s) planned.
+
+--- Step s1: Fix math_utils implementations ---
+[EXECUTOR] attempt 1: 1 edit(s), 1 file(s) changed.
+[CHECK] PASS (python -m pytest -q)
+
+>> PAID-TOKEN SAVINGS: 45.3%
+RESULT: SUCCESS (1/1 steps passed)
+```
+
+The paid Supervisor processed ~1k tokens of planning; the free local Executor
+did the file reading and editing. On larger, multi-file tasks the Executor's
+share — and the savings — grow.
+
 ## How the savings are measured (honestly)
 
 Maestro never hides the math. The ledger computes:
@@ -82,12 +107,14 @@ savings       = 1 - actual_cost / baseline_cost
 ```
 
 So "savings" means **paid-token cost shifted to the free model** — *not* "90%
-less compute". Two honest caveats:
+less compute". The exact figure depends on the task:
 
-- The bundled `demo` is a 20-line toy, so the Executor reads very little and
-  savings land around **~50%**.
-- On a **real repository**, the Executor repeatedly reads large files that the
-  Supervisor never sees, so the share climbs toward **80–95%**. The bigger the
+- Tiny jobs save less: a one-function fix where the Supervisor writes a verbose
+  plan can land around **45%** (the live run above).
+- The realistic `demo --pro` (a ~150-line module, two supervised steps) lands
+  around **~78%**.
+- On a **large, multi-file repo** where the Executor repeatedly reads big files
+  the Supervisor never sees, the share climbs toward **80–95%**. The bigger the
   codebase, the bigger the gap.
 
 Set your real provider prices in [`maestro/config.py`](maestro/config.py).

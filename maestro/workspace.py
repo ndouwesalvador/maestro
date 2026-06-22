@@ -40,9 +40,13 @@ class Workspace:
         for p in sorted(self.root.rglob("*")):
             if p.is_dir():
                 continue
-            if any(part in _SKIP_DIRS for part in p.parts):
+            rel = p.relative_to(self.root)
+            # Check ignore list against the workspace-relative parts only — an
+            # ancestor directory named like one of these (e.g. a workspace under
+            # .maestro/) must not hide the whole tree.
+            if any(part in _SKIP_DIRS for part in rel.parts):
                 continue
-            out.append(str(p.relative_to(self.root)).replace("\\", "/"))
+            out.append(str(rel).replace("\\", "/"))
             if len(out) >= limit:
                 break
         return out
