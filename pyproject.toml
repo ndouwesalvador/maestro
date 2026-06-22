@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "maestro-ai"
+version = "0.1.0"
+description = "One frontier model conducts an orchestra of free local models — save ~90% of paid tokens by supervising a cheap local agent only when it diverges."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Maestro contributors" }]
+keywords = [
+    "llm", "agents", "multi-agent", "orchestration",
+    "ollama", "anthropic", "claude", "token-efficiency", "local-llm",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = []  # core runs on the standard library only
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.40"]
+dev = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/your-username/maestro"
+Issues = "https://github.com/your-username/maestro/issues"
+
+[project.scripts]
+maestro = "maestro.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["maestro*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

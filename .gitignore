@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Local secrets / config
+.env
+
+# Maestro run artifacts (working copies, logs)
+.maestro/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
