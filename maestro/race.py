@@ -33,6 +33,7 @@ class RacerResult:
     summary: str = ""
     workdir: str = ""
     error: str = ""
+    spec: str = ""  # the original --models entry, used to key live UI state
 
     @property
     def tokens(self) -> int:
@@ -77,7 +78,7 @@ def _solo_run(spec: str, repo: Path, task: str, check: str, max_attempts: int) -
             report = run_check(check, ws.root, "race")
             if report.passed:
                 cost = in_tok / 1e6 * price.input_per_mtok + out_tok / 1e6 * price.output_per_mtok
-                return RacerResult(agent.name, True, attempt, in_tok, out_tok, cost, summary, str(ws.root))
+                return RacerResult(agent.name, True, attempt, in_tok, out_tok, cost, summary, str(ws.root), spec=spec)
             # self-correct: hand the failure back to the same model
             instruction = (
                 f"{task}\n\nYour previous attempt FAILED the check:\n"
@@ -85,9 +86,9 @@ def _solo_run(spec: str, repo: Path, task: str, check: str, max_attempts: int) -
             )
 
         cost = in_tok / 1e6 * price.input_per_mtok + out_tok / 1e6 * price.output_per_mtok
-        return RacerResult(agent.name, False, attempt, in_tok, out_tok, cost, summary, str(ws.root))
+        return RacerResult(agent.name, False, attempt, in_tok, out_tok, cost, summary, str(ws.root), spec=spec)
     except Exception as exc:  # one bad racer must not kill the whole race
-        return RacerResult(spec, False, 0, 0, 0, 0.0, error=str(exc)[:300], workdir=str(workdir))
+        return RacerResult(spec, False, 0, 0, 0, 0.0, error=str(exc)[:300], workdir=str(workdir), spec=spec)
 
 
 def race(
@@ -97,6 +98,7 @@ def race(
     check: str,
     max_attempts: int = 3,
     logger: Optional[Callable[[str], None]] = None,
+    on_result: Optional[Callable[[RacerResult], None]] = None,
 ) -> List[RacerResult]:
     log = logger or (lambda _m: None)
     repo_path = Path(repo).resolve()
@@ -117,6 +119,8 @@ def race(
                     f"  [{r.model}] {verdict}  attempts={r.attempts}  "
                     f"tokens={r.tokens}  cost=${r.cost:.4f}"
                 )
+            if on_result:
+                on_result(r)
             results.append(r)
     return results
 

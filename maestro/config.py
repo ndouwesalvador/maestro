@@ -22,6 +22,9 @@ PROVIDER_PRICES = {
     "anthropic": Price(5.0, 25.0),
     "claude-cli": Price(5.0, 25.0),   # Claude subscription (API-equivalent value)
     "codex-cli": Price(2.5, 10.0),    # ChatGPT/Codex subscription (API-equivalent)
+    "deepseek": Price(0.3, 1.2),      # DeepSeek API (cheap)
+    "gemini": Price(0.0, 0.0),        # Gemini free tier
+    "openrouter": Price(0.0, 0.0),    # OpenRouter free open-source models
     "openai": Price(0.0, 0.0),
     "ollama": Price(0.0, 0.0),        # local / cloud open-source = free
     "mock": Price(0.0, 0.0),
@@ -71,6 +74,26 @@ def build_agent(role: str, kind: str, model_override: str = "") -> Agent:
             role=role,
         )
 
+    # DeepSeek, Gemini and OpenRouter are all OpenAI-compatible endpoints.
+    if kind in ("deepseek", "gemini", "openrouter"):
+        from .agents.openai_compat import OpenAICompatAgent
+
+        presets = {
+            "deepseek": ("https://api.deepseek.com/v1", "DEEPSEEK_API_KEY", "deepseek-chat"),
+            "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai",
+                       "GEMINI_API_KEY", "gemini-2.0-flash"),
+            "openrouter": ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY",
+                           "deepseek/deepseek-chat-v3-0324:free"),
+        }
+        base_url, key_env, default_model = presets[kind]
+        env_model = _env(f"MAESTRO_{kind.upper()}_MODEL", default_model)
+        return OpenAICompatAgent(
+            model=model_override or env_model,
+            base_url=base_url,
+            api_key=_env(key_env, "not-needed"),
+            role=role,
+        )
+
     if kind == "claude-cli":
         from .agents.cli_agent import ClaudeCliAgent
 
@@ -82,7 +105,8 @@ def build_agent(role: str, kind: str, model_override: str = "") -> Agent:
         return CodexCliAgent(model=model_override or _env("MAESTRO_CODEX_MODEL", ""), role=role)
 
     raise SystemExit(
-        f"Unknown backend '{kind}'. Use: claude-cli | codex-cli | ollama | anthropic | openai."
+        f"Unknown backend '{kind}'. Use: claude-cli | codex-cli | ollama | "
+        "deepseek | gemini | openrouter | anthropic | openai."
     )
 
 

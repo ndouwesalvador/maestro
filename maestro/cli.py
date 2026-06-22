@@ -449,6 +449,18 @@ def cmd_race(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# serve (web control room)
+# --------------------------------------------------------------------------- #
+def cmd_serve(args) -> int:
+    _load_dotenv()
+    print(BANNER)
+    from .server import serve
+
+    serve(args.host, args.port, open_browser=not args.no_browser)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # entrypoint
 # --------------------------------------------------------------------------- #
 def main(argv=None) -> int:
@@ -466,7 +478,7 @@ def main(argv=None) -> int:
     p_demo = sub.add_parser("demo", help="run the offline, zero-config demo")
     p_demo.add_argument("--pro", action="store_true", help="use the larger, more realistic demo project")
 
-    providers = ["claude-cli", "codex-cli", "ollama", "anthropic", "openai"]
+    providers = ["claude-cli", "codex-cli", "ollama", "deepseek", "gemini", "openrouter", "anthropic", "openai"]
 
     p_run = sub.add_parser("run", help="run on a real task with real backends")
     p_run.add_argument("--task", required=True, help="task description, or path to a .md/.txt file")
@@ -483,6 +495,11 @@ def main(argv=None) -> int:
     p_race.add_argument("--models", required=True, help="comma-separated providers, e.g. claude-cli,ollama,codex-cli")
     p_race.add_argument("--max-attempts", type=int, default=3)
 
+    p_serve = sub.add_parser("serve", help="launch the web control room (dashboard)")
+    p_serve.add_argument("--host", default="127.0.0.1")
+    p_serve.add_argument("--port", type=int, default=8765)
+    p_serve.add_argument("--no-browser", action="store_true", help="don't auto-open a browser")
+
     args = parser.parse_args(argv)
     if args.cmd == "demo":
         return cmd_demo(args)
@@ -490,6 +507,8 @@ def main(argv=None) -> int:
         return cmd_run(args)
     if args.cmd == "race":
         return cmd_race(args)
+    if args.cmd == "serve":
+        return cmd_serve(args)
     parser.print_help()
     return 2
 

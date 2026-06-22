@@ -100,7 +100,10 @@ headless:
 | `claude-cli` | your Claude Pro/Max plan (drives `claude -p`) | ✅ none — subscription |
 | `codex-cli` | your ChatGPT/Codex plan (drives `codex exec`) | ✅ none — subscription |
 | `ollama` | local models **or** Ollama cloud open-source (`gpt-oss`, `glm`) | ✅ none — free |
-| `anthropic` / `openai` | Anthropic, or any OpenAI-compatible endpoint (DeepSeek, OpenRouter, vLLM…) | needs key |
+| `deepseek` | DeepSeek API (`deepseek-chat` / `reasoner`) | cheap key |
+| `gemini` | Google Gemini (OpenAI-compatible endpoint) | free-tier key |
+| `openrouter` | OpenRouter — many **free** open-source models | free key |
+| `anthropic` / `openai` | Anthropic API, or any OpenAI-compatible endpoint (vLLM, LM Studio…) | needs key |
 
 So you can pair a **paid brain** with a **free open-source worker** and burn far
 less of your paid quota:
@@ -137,6 +140,17 @@ WINNER: ollama:gpt-oss:120b-cloud  (cheapest passing, $0.0000)
 
 A failing or unauthorized model never breaks the race — it's reported and the
 others carry on.
+
+## Web control room — `maestro serve`
+
+Prefer a UI? `maestro serve` opens a local dashboard (zero dependencies — just the
+standard library) where you configure a race and **watch every model work live**:
+status, attempts, tokens and cost updating in real time, with the winner
+highlighted.
+
+```bash
+maestro serve            # opens http://127.0.0.1:8765
+```
 
 ## How the savings are measured (honestly)
 
