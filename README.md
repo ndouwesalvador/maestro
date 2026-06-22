@@ -40,8 +40,8 @@ No API key, no GPU. The demo ships a tiny buggy project and two scripted mock
 models so you can watch the whole loop (and the token ledger) run:
 
 ```bash
-git clone https://github.com/ndouwesalvador/yintouin_VoxClone
-cd yintouin_VoxClone
+git clone https://github.com/ndouwesalvador/maestro
+cd maestro
 python -m maestro demo
 ```
 

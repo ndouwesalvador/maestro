@@ -26,8 +26,8 @@ anthropic = ["anthropic>=0.40"]
 dev = ["pytest>=7"]
 
 [project.urls]
-Homepage = "https://github.com/ndouwesalvador/yintouin_VoxClone"
-Issues = "https://github.com/ndouwesalvador/yintouin_VoxClone/issues"
+Homepage = "https://github.com/ndouwesalvador/maestro"
+Issues = "https://github.com/ndouwesalvador/maestro/issues"
 
 [project.scripts]
 maestro = "maestro.cli:main"
