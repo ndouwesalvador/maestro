@@ -52,21 +52,17 @@ the tokens spent on each side.
 ## Real usage
 
 ```bash
-pip install -e ".[anthropic]"        # core has zero dependencies; this adds Claude
-ollama pull qwen2.5-coder:7b         # your free local Executor
-export ANTHROPIC_API_KEY=sk-ant-...  # your paid Supervisor
+# Option A — use your SUBSCRIPTIONS, no API key (recommended):
+#   just have `claude` and/or `codex` installed and logged in.
+maestro run --task examples/task.md --repo examples/broken_math \
+  --supervisor claude-cli --executor ollama --copy
 
-maestro run \
-  --task examples/task.md \
-  --repo examples/broken_math \
-  --supervisor anthropic \
-  --executor ollama \
-  --copy                              # work on a copy under .maestro/ first
+# Option B — API keys (Anthropic, or any OpenAI-compatible: DeepSeek, OpenRouter…):
+pip install -e ".[anthropic]"
+export ANTHROPIC_API_KEY=sk-ant-...
+maestro run --task examples/task.md --repo examples/broken_math \
+  --supervisor anthropic --executor ollama --copy
 ```
-
-Mix and match any backend for either role (`anthropic`, `ollama`, `openai`).
-`openai` means **any** OpenAI-compatible endpoint — LM Studio, vLLM,
-llama.cpp, OpenRouter, etc.
 
 ## Proof — a real, verified run
 
@@ -92,6 +88,55 @@ RESULT: SUCCESS (1/1 steps passed)
 The paid Supervisor processed ~1k tokens of planning; the free local Executor
 did the file reading and editing. On larger, multi-file tasks the Executor's
 share — and the savings — grow.
+
+## Multi-provider: paid subscriptions + free open-source
+
+Maestro talks to models through swappable backends — and crucially it can use
+your **paid subscriptions without any API key** by driving the official CLIs
+headless:
+
+| Backend | Access | API key? |
+|---|---|---|
+| `claude-cli` | your Claude Pro/Max plan (drives `claude -p`) | ✅ none — subscription |
+| `codex-cli` | your ChatGPT/Codex plan (drives `codex exec`) | ✅ none — subscription |
+| `ollama` | local models **or** Ollama cloud open-source (`gpt-oss`, `glm`) | ✅ none — free |
+| `anthropic` / `openai` | Anthropic, or any OpenAI-compatible endpoint (DeepSeek, OpenRouter, vLLM…) | needs key |
+
+So you can pair a **paid brain** with a **free open-source worker** and burn far
+less of your paid quota:
+
+```bash
+maestro run --task task.md --repo ./project --supervisor claude-cli --executor ollama
+```
+
+> The subscription CLIs authenticate from **your own terminal**. They can't be
+> driven from *inside* another Claude Code session (the nested process can't see
+> the brokered login), but a normal terminal works.
+
+## Run several models in parallel — `race` (best-of-N)
+
+Race multiple models on the **same task** at once. Each works on its own private
+copy, and the cheapest one that **passes the check** wins:
+
+```bash
+maestro race \
+  --task "Fix the failing tests" \
+  --repo ./examples/broken_math \
+  --check "python -m pytest -q" \
+  --models "claude-cli,ollama:gpt-oss:120b-cloud,ollama:llama3"
+```
+
+Real output — two open-source models (one cloud, one local) racing in parallel:
+
+```text
+Racing 2 model(s) in parallel: ollama:gpt-oss:120b-cloud, ollama:llama3:latest
+  [ollama:gpt-oss:120b-cloud] PASS  attempts=1  tokens=752   cost=$0.0000
+  [ollama:llama3:latest]      PASS  attempts=3  tokens=1981  cost=$0.0000
+WINNER: ollama:gpt-oss:120b-cloud  (cheapest passing, $0.0000)
+```
+
+A failing or unauthorized model never breaks the race — it's reported and the
+others carry on.
 
 ## How the savings are measured (honestly)
 

@@ -402,7 +402,7 @@ def cmd_run(args) -> int:
 
     supervisor = build_agent("supervisor", args.supervisor)
     executor = build_agent("executor", args.executor)
-    ledger = Ledger(SUPERVISOR_PRICE, price_for(args.executor))
+    ledger = Ledger(price_for(args.supervisor), price_for(args.executor))
 
     print(BANNER)
     print(f"Supervisor: {supervisor.name}   Executor: {executor.name}\n")
@@ -413,6 +413,39 @@ def cmd_run(args) -> int:
     )
     result = orch.run(goal)
     return _print_result(result, ledger)
+
+
+# --------------------------------------------------------------------------- #
+# race (multiple models in parallel, best-of-N)
+# --------------------------------------------------------------------------- #
+def cmd_race(args) -> int:
+    _load_dotenv()
+    task = Path(args.task).read_text(encoding="utf-8") if Path(args.task).is_file() else args.task
+    models = [m.strip() for m in args.models.split(",") if m.strip()]
+    if not models:
+        raise SystemExit("--models must list at least one provider, e.g. claude-cli,ollama")
+
+    print(BANNER)
+    print(f"RACE — {len(models)} model(s), same task, best-of-N\n")
+
+    from .race import pick_winner, race
+
+    results = race(models, args.repo, task, args.check, args.max_attempts, logger=print)
+
+    print("\n+---------------------- RACE RESULTS ----------------------+")
+    for r in sorted(results, key=lambda r: (not r.passed, r.cost, r.tokens)):
+        status = "PASS" if r.passed else ("ERR " if r.error else "fail")
+        note = r.error or r.summary
+        print(f"  {status}  {r.model:<22} tokens={r.tokens:<7} cost=${r.cost:.4f}  {note[:40]}")
+    print("+----------------------------------------------------------+")
+
+    winner = pick_winner(results)
+    if winner:
+        print(f"\nWINNER: {winner.model}  (cheapest passing, ${winner.cost:.4f})")
+        print(f"  fixed copy: {winner.workdir}")
+        return 0
+    print("\nNo model passed the check.")
+    return 1
 
 
 # --------------------------------------------------------------------------- #
@@ -433,19 +466,30 @@ def main(argv=None) -> int:
     p_demo = sub.add_parser("demo", help="run the offline, zero-config demo")
     p_demo.add_argument("--pro", action="store_true", help="use the larger, more realistic demo project")
 
+    providers = ["claude-cli", "codex-cli", "ollama", "anthropic", "openai"]
+
     p_run = sub.add_parser("run", help="run on a real task with real backends")
     p_run.add_argument("--task", required=True, help="task description, or path to a .md/.txt file")
     p_run.add_argument("--repo", required=True, help="directory the Executor may edit")
-    p_run.add_argument("--supervisor", default="anthropic", choices=["anthropic", "ollama", "openai"])
-    p_run.add_argument("--executor", default="ollama", choices=["anthropic", "ollama", "openai"])
+    p_run.add_argument("--supervisor", default="claude-cli", choices=providers)
+    p_run.add_argument("--executor", default="ollama", choices=providers)
     p_run.add_argument("--max-attempts", type=int, default=3)
     p_run.add_argument("--copy", action="store_true", help="work on a copy under .maestro/ instead of in place")
+
+    p_race = sub.add_parser("race", help="run several models in parallel on the same task; keep the winner")
+    p_race.add_argument("--task", required=True, help="task description, or path to a file")
+    p_race.add_argument("--repo", required=True, help="directory to fix (each model gets its own copy)")
+    p_race.add_argument("--check", required=True, help="shell command that exits 0 when the task is done")
+    p_race.add_argument("--models", required=True, help="comma-separated providers, e.g. claude-cli,ollama,codex-cli")
+    p_race.add_argument("--max-attempts", type=int, default=3)
 
     args = parser.parse_args(argv)
     if args.cmd == "demo":
         return cmd_demo(args)
     if args.cmd == "run":
         return cmd_run(args)
+    if args.cmd == "race":
+        return cmd_race(args)
     parser.print_help()
     return 2
 
