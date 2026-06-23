@@ -1,22 +1,33 @@
-"""Autonomous coding-agent backends.
+"""Autonomous coding-agent backends + a watchdog that stops them when they
+"go off the rails".
 
-Unlike the completion agents (which return SEARCH/REPLACE text that Maestro
-applies), these are full agent CLIs — Claude Code, Codex, opencode — that edit
-files themselves inside a given working directory. Maestro hands each one a copy
-of the repo and a task, lets it work, then runs the check. This is what lets a
-paid subscription agent and a free open-source agent compete on equal footing.
+Unlike completion agents (which return SEARCH/REPLACE text Maestro applies),
+these are full agent CLIs — Claude Code, Codex, opencode — that edit files
+themselves. That power needs guardrails: `run_supervised` launches the agent in
+an isolated copy and watches it live, killing the whole process tree the moment
+it:
+  - passes the check        -> "passed"  (done, stop early)
+  - finishes on its own     -> "exited"
+  - edits too many files     -> "runaway" (rampaging off-task)
+  - goes quiet after editing -> "stalled" (looping / talking, not progressing)
+  - exceeds the time budget  -> "timeout"
 """
 
 from __future__ import annotations
 
 import os
 import subprocess
+import tempfile
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..verify import run_check
 from .base import Usage, estimate_tokens
 from .cli_agent import _parse_claude_json, _resolve
+
+_IGNORE = {".git", "__pycache__", ".pytest_cache", ".maestro", "node_modules", ".opencode"}
 
 
 def _kill_tree(pid: int) -> None:
@@ -34,24 +45,107 @@ def _kill_tree(pid: int) -> None:
                 pass
 
 
-def _run_capture(cmd, cwd, timeout):
-    """Run a command; if it refuses to exit (some agent CLIs leave a server
-    alive), kill its process tree after `timeout` and proceed — the objective
-    check decides success anyway. Returns (stdout, timed_out)."""
-    proc = subprocess.Popen(
-        cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace",
-    )
-    try:
-        out, _ = proc.communicate(timeout=timeout)
-        return out or "", False
-    except subprocess.TimeoutExpired:
-        _kill_tree(proc.pid)
+def _snapshot(root: Path) -> dict:
+    snap = {}
+    for p in root.rglob("*"):
+        if p.is_dir():
+            continue
+        rel = p.relative_to(root)
+        if any(part in _IGNORE for part in rel.parts):
+            continue
         try:
-            out, _ = proc.communicate(timeout=15)
-        except Exception:
-            out = ""
-        return out or "", True
+            st = p.stat()
+            snap[str(rel)] = (st.st_mtime, st.st_size)
+        except OSError:
+            pass
+    return snap
+
+
+def _changed(base: dict, snap: dict) -> int:
+    keys = set(base) | set(snap)
+    return sum(1 for k in keys if base.get(k) != snap.get(k))
+
+
+@dataclass
+class SupervisedResult:
+    reason: str          # passed | exited | runaway | stalled | timeout
+    output: str = ""
+    changed_files: int = 0
+
+
+def run_supervised(
+    cmd,
+    cwd,
+    stdin_text: str = "",
+    check: str = "",
+    timeout=None,
+    stall=None,
+    max_files=None,
+    poll: float = 4.0,
+) -> SupervisedResult:
+    """Run an agent CLI under a watchdog. Always returns (and always leaves no
+    process behind), stopping on the first trigger above."""
+    timeout = timeout or int(os.environ.get("MAESTRO_AGENT_TIMEOUT", "240"))
+    stall = stall or int(os.environ.get("MAESTRO_AGENT_STALL", "60"))
+    max_files = max_files or int(os.environ.get("MAESTRO_AGENT_MAX_FILES", "40"))
+
+    cwd = Path(cwd)
+    base = _snapshot(cwd)
+    out_path = Path(tempfile.mkstemp(suffix=".maestro-out")[1])
+    reason = "exited"
+    try:
+        with open(out_path, "w", encoding="utf-8", errors="replace") as fo:
+            proc = subprocess.Popen(
+                cmd, cwd=str(cwd),
+                stdin=(subprocess.PIPE if stdin_text else None),
+                stdout=fo, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+            )
+            if stdin_text:
+                try:
+                    proc.stdin.write(stdin_text)
+                    proc.stdin.close()
+                except Exception:
+                    pass
+
+            start = last_change = time.time()
+            seen_change = False
+            last_snap = base
+            while True:
+                if check and run_check(check, cwd).passed:
+                    reason = "passed"
+                    break
+                if proc.poll() is not None:
+                    reason = "exited"
+                    break
+                snap = _snapshot(cwd)
+                if _changed(base, snap) > max_files:
+                    reason = "runaway"
+                    break
+                if snap != last_snap:
+                    last_snap, last_change, seen_change = snap, time.time(), True
+                now = time.time()
+                if now - start > timeout:
+                    reason = "timeout"
+                    break
+                if seen_change and now - last_change > stall:
+                    reason = "stalled"
+                    break
+                time.sleep(poll)
+
+            changed = _changed(base, _snapshot(cwd))
+            if proc.poll() is None:
+                _kill_tree(proc.pid)
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                pass
+        output = out_path.read_text(encoding="utf-8", errors="replace")
+    finally:
+        try:
+            out_path.unlink()
+        except OSError:
+            pass
+    return SupervisedResult(reason, output, changed)
 
 
 @dataclass
@@ -59,6 +153,7 @@ class ActResult:
     usage: Usage
     summary: str
     raw: str = ""
+    reason: str = ""
 
 
 class AutonomousAgent(ABC):
@@ -67,78 +162,60 @@ class AutonomousAgent(ABC):
     model: str = ""
 
     @abstractmethod
-    def act(self, task: str, workdir) -> ActResult:
-        """Edit files under `workdir` to accomplish `task`."""
+    def act(self, task: str, workdir, check: str = "") -> ActResult:
+        """Edit files under `workdir` to accomplish `task`, under the watchdog."""
         raise NotImplementedError
 
 
 class ClaudeCodeAgent(AutonomousAgent):
     """Claude Code as an autonomous editor (your Claude subscription)."""
 
-    def __init__(self, model: str = "", timeout: int = 900) -> None:
+    def __init__(self, model: str = "") -> None:
         self.model = model
         self.name = "claude-code" + (f":{model}" if model else "")
-        self.timeout = timeout
 
-    def act(self, task: str, workdir) -> ActResult:
+    def act(self, task: str, workdir, check: str = "") -> ActResult:
         cmd = _resolve("claude") + ["-p", "--output-format", "json", "--dangerously-skip-permissions"]
         if self.model:
             cmd += ["--model", self.model]
-        proc = subprocess.run(
-            cmd, input=task, cwd=str(workdir), capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=self.timeout,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(f"claude failed ({proc.returncode}): {(proc.stderr or proc.stdout or '')[-400:]}")
-        text, usage = _parse_claude_json(proc.stdout)
-        return ActResult(usage, (text or "edited").strip()[:140], proc.stdout)
+        res = run_supervised(cmd, workdir, stdin_text=task, check=check)
+        text, usage = _parse_claude_json(res.output)
+        return ActResult(usage, (text or "").strip()[:120] or res.reason, res.output, res.reason)
 
 
 class CodexAgent(AutonomousAgent):
     """Codex as an autonomous editor (your ChatGPT/Codex subscription)."""
 
-    def __init__(self, model: str = "", timeout: int = 900) -> None:
+    def __init__(self, model: str = "") -> None:
         self.model = model
         self.name = "codex" + (f":{model}" if model else "")
-        self.timeout = timeout
 
-    def act(self, task: str, workdir) -> ActResult:
+    def act(self, task: str, workdir, check: str = "") -> ActResult:
         cmd = _resolve("codex") + ["exec", "--sandbox", "workspace-write"]
         if self.model:
             cmd += ["-m", self.model]
-        cmd += ["-"]  # task from stdin
-        proc = subprocess.run(
-            cmd, input=task, cwd=str(workdir), capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=self.timeout,
+        cmd += ["-"]
+        res = run_supervised(cmd, workdir, stdin_text=task, check=check)
+        return ActResult(
+            Usage(estimate_tokens(task), estimate_tokens(res.output)),
+            (res.output.strip()[-120:] or res.reason), res.output, res.reason,
         )
-        if proc.returncode != 0:
-            raise RuntimeError(f"codex failed ({proc.returncode}): {(proc.stderr or '')[-400:]}")
-        out = (proc.stdout or "").strip()
-        return ActResult(Usage(estimate_tokens(task), estimate_tokens(out)), out[-140:] or "edited", out)
 
 
 class OpencodeAgent(AutonomousAgent):
-    """opencode as an autonomous editor — gateway to free models (DeepSeek, etc.).
+    """opencode as an autonomous editor — gateway to free models (DeepSeek, etc.)."""
 
-    Uses --pure (skip plugins) and a bounded run: opencode can leave a server
-    process alive instead of exiting, so if it lingers past the timeout we kill
-    the tree and let the check decide whether the edits worked.
-    """
-
-    def __init__(self, model: str = "", timeout: int = 240) -> None:
+    def __init__(self, model: str = "") -> None:
         self.model = model
         self.name = "opencode" + (f":{model}" if model else "")
-        self.timeout = timeout
 
-    def act(self, task: str, workdir) -> ActResult:
-        cmd = _resolve("opencode") + ["run", "--pure", "--dir", str(workdir)]
+    def act(self, task: str, workdir, check: str = "") -> ActResult:
+        cmd = _resolve("opencode") + ["run", "--dir", str(workdir)]
         if self.model:
             cmd += ["-m", self.model]
         cmd += [task]
-        out, timed_out = _run_capture(cmd, str(workdir), self.timeout)
-        out = out.strip()
-        note = "edited (opencode lingered; proceeded)" if timed_out else "edited"
-        return ActResult(Usage(estimate_tokens(task), estimate_tokens(out)), out[-140:] or note, out)
+        res = run_supervised(cmd, workdir, check=check)
+        return ActResult(Usage(estimate_tokens(task), 50), res.reason, res.output, res.reason)
 
 
 class MockAutonomousAgent(AutonomousAgent):
@@ -149,8 +226,8 @@ class MockAutonomousAgent(AutonomousAgent):
         self.name = name
         self.model = "mock"
 
-    def act(self, task: str, workdir) -> ActResult:
+    def act(self, task: str, workdir, check: str = "") -> ActResult:
         wd = Path(workdir)
         for rel, content in self._files.items():
             (wd / rel).write_text(content, encoding="utf-8")
-        return ActResult(Usage(estimate_tokens(task), 20), "wrote " + ", ".join(self._files))
+        return ActResult(Usage(estimate_tokens(task), 20), "wrote " + ", ".join(self._files), reason="exited")

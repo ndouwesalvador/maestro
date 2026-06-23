@@ -1,6 +1,6 @@
 import sys
 
-from maestro.agents.autonomous import MockAutonomousAgent
+from maestro.agents.autonomous import MockAutonomousAgent, run_supervised
 from maestro.config import AUTONOMOUS_KINDS
 from maestro.race import _autonomous_loop, _parse_spec
 from maestro.workspace import Workspace
@@ -31,3 +31,36 @@ def test_parse_spec_and_autonomous_kinds():
     )
     assert _parse_spec("claude-code") == ("claude-code", "")
     assert {"opencode", "claude-code", "codex"} <= AUTONOMOUS_KINDS
+
+
+# --- watchdog: stop the agent when it "goes off the rails" --------------------
+def test_watchdog_stops_on_success_and_kills_lingerer(tmp_path):
+    # An agent that does the work, then refuses to exit (sleeps forever).
+    (tmp_path / "agent.py").write_text(
+        "import time, pathlib\npathlib.Path('done.txt').write_text('ok')\ntime.sleep(120)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "check.py").write_text(
+        "import os, sys\nsys.exit(0 if os.path.exists('done.txt') else 1)\n", encoding="utf-8"
+    )
+    res = run_supervised(
+        [sys.executable, "agent.py"], tmp_path,
+        check=f'"{sys.executable}" check.py', timeout=30, poll=0.5,
+    )
+    assert res.reason == "passed"
+    assert (tmp_path / "done.txt").exists()
+
+
+def test_watchdog_timeout(tmp_path):
+    (tmp_path / "spin.py").write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
+    res = run_supervised([sys.executable, "spin.py"], tmp_path, timeout=2, poll=0.5)
+    assert res.reason == "timeout"
+
+
+def test_watchdog_runaway_files(tmp_path):
+    (tmp_path / "spam.py").write_text(
+        "import time, pathlib\nfor i in range(100):\n    pathlib.Path(f'f{i}.txt').write_text('x')\ntime.sleep(60)\n",
+        encoding="utf-8",
+    )
+    res = run_supervised([sys.executable, "spam.py"], tmp_path, max_files=10, timeout=30, poll=0.5)
+    assert res.reason == "runaway"

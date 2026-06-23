@@ -77,7 +77,7 @@ def _autonomous_loop(agent, ws, task, check, max_attempts):
     summary = ""
     instruction = f"{task}\n\nWhen you are done, this command must exit 0: {check}"
     for attempt in range(1, max_attempts + 1):
-        res = agent.act(instruction, ws.root)
+        res = agent.act(instruction, ws.root, check)
         in_tok += res.usage.input_tokens
         out_tok += res.usage.output_tokens
         summary = res.summary or summary

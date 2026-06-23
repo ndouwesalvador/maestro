@@ -137,8 +137,5 @@ def build_autonomous_agent(kind: str, model_override: str = ""):
     if kind == "opencode":
         from .agents.autonomous import OpencodeAgent
 
-        return OpencodeAgent(
-            model=model_override or _env("MAESTRO_OPENCODE_MODEL", ""),
-            timeout=int(_env("MAESTRO_OPENCODE_TIMEOUT", "240")),
-        )
+        return OpencodeAgent(model=model_override or _env("MAESTRO_OPENCODE_MODEL", ""))
     raise SystemExit(f"Unknown autonomous backend '{kind}'. Use: claude-code | codex | opencode.")

@@ -158,6 +158,20 @@ maestro race --task "Fix the failing tests" --repo ./examples/broken_math \
 *Verified: `opencode` driving a **free** DeepSeek model fixed the bug
 autonomously and `pytest` went green — at $0.*
 
+### Guardrails — stop an agent when it goes off the rails
+
+Autonomous agents are powerful, so they run under a **watchdog** that watches the
+workspace live and kills the whole process tree the moment the agent:
+
+- ✅ **passes the check** — done, stop early (no waiting for slow agents to exit)
+- 🛑 **`runaway`** — edits too many files (rampaging off-task)
+- 🛑 **`stalled`** — goes quiet after editing (looping / talking, not progressing)
+- 🛑 **`timeout`** — exceeds the time budget
+
+Tunable via `MAESTRO_AGENT_TIMEOUT`, `MAESTRO_AGENT_STALL`, `MAESTRO_AGENT_MAX_FILES`.
+And since each racer works on an **isolated copy**, a misbehaving agent can never
+touch your real repo. The stop reason is reported per racer.
+
 ## Web control room — `maestro serve`
 
 Prefer a UI? `maestro serve` opens a local dashboard (zero dependencies — just the
