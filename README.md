@@ -141,6 +141,23 @@ WINNER: ollama:gpt-oss:120b-cloud  (cheapest passing, $0.0000)
 A failing or unauthorized model never breaks the race — it's reported and the
 others carry on.
 
+**Two kinds of racers can compete side by side:**
+
+- **Completion** (`ollama`, `deepseek`, `gemini`, `openrouter`, …) — the model
+  returns edits and Maestro applies them.
+- **Autonomous agents** (`claude-code`, `codex`, `opencode`) — the full agent CLI
+  edits its own copy of the repo directly. This lets a **paid subscription agent**
+  and a **free open-source agent** race head-to-head:
+
+```bash
+maestro race --task "Fix the failing tests" --repo ./examples/broken_math \
+  --check "python -m pytest -q" \
+  --models "claude-code,opencode:opencode/deepseek-v4-flash-free"
+```
+
+*Verified: `opencode` driving a **free** DeepSeek model fixed the bug
+autonomously and `pytest` went green — at $0.*
+
 ## Web control room — `maestro serve`
 
 Prefer a UI? `maestro serve` opens a local dashboard (zero dependencies — just the

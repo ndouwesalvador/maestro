@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional
 
-from .config import build_agent, price_for
+from .config import AUTONOMOUS_KINDS, build_agent, build_autonomous_agent, price_for
 from .orchestrator import EXEC_SYS, _exec_user
 from .protocol import Step, parse_edits, parse_summary
 from .verify import run_check
@@ -50,43 +50,72 @@ def _parse_spec(spec: str):
     return spec.lower(), ""
 
 
+def _completion_loop(agent, ws, task, check, max_attempts):
+    """Agent returns SEARCH/REPLACE text; Maestro applies it, then checks."""
+    in_tok = out_tok = attempt = 0
+    summary = ""
+    instruction = task
+    for attempt in range(1, max_attempts + 1):
+        step = Step(id="race", title="task", instruction=instruction, check=check)
+        resp = agent.chat(EXEC_SYS, _exec_user(step, ws.context(), ", ".join(ws.files())))
+        in_tok += resp.usage.input_tokens
+        out_tok += resp.usage.output_tokens
+        summary = parse_summary(resp.text) or summary
+        ws.apply_edits(parse_edits(resp.text))
+        if run_check(check, ws.root, "race").passed:
+            return True, attempt, in_tok, out_tok, summary
+        instruction = (
+            f"{task}\n\nYour previous attempt FAILED the check:\n"
+            f"{run_check(check, ws.root, 'race').compact()}\nFix the code so the check passes."
+        )
+    return False, attempt, in_tok, out_tok, summary
+
+
+def _autonomous_loop(agent, ws, task, check, max_attempts):
+    """Agent edits files in its copy itself; Maestro just runs the check."""
+    in_tok = out_tok = attempt = 0
+    summary = ""
+    instruction = f"{task}\n\nWhen you are done, this command must exit 0: {check}"
+    for attempt in range(1, max_attempts + 1):
+        res = agent.act(instruction, ws.root)
+        in_tok += res.usage.input_tokens
+        out_tok += res.usage.output_tokens
+        summary = res.summary or summary
+        report = run_check(check, ws.root, "race")
+        if report.passed:
+            return True, attempt, in_tok, out_tok, summary
+        instruction = (
+            f"{task}\n\nYour previous attempt FAILED:\n{report.compact()}\n"
+            f"Fix the code so `{check}` exits 0."
+        )
+    return False, attempt, in_tok, out_tok, summary
+
+
 def _solo_run(spec: str, repo: Path, task: str, check: str, max_attempts: int) -> RacerResult:
     """One model attempts the task on its own copy, self-correcting on failure."""
     kind, model_override = _parse_spec(spec)
     workdir = Path(".maestro") / "race" / spec.replace(":", "_").replace("/", "_")
     try:
-        agent = build_agent("executor", kind, model_override)
-        price = price_for(kind)
-
         if workdir.exists():
             shutil.rmtree(workdir)
         workdir.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(repo, workdir)
         ws = Workspace(workdir)
+        price = price_for(kind)
 
-        in_tok = out_tok = 0
-        instruction = task
-        summary = ""
-        attempt = 0
-        for attempt in range(1, max_attempts + 1):
-            step = Step(id="race", title="task", instruction=instruction, check=check)
-            resp = agent.chat(EXEC_SYS, _exec_user(step, ws.context(), ", ".join(ws.files())))
-            in_tok += resp.usage.input_tokens
-            out_tok += resp.usage.output_tokens
-            summary = parse_summary(resp.text) or summary
-            ws.apply_edits(parse_edits(resp.text))
-            report = run_check(check, ws.root, "race")
-            if report.passed:
-                cost = in_tok / 1e6 * price.input_per_mtok + out_tok / 1e6 * price.output_per_mtok
-                return RacerResult(agent.name, True, attempt, in_tok, out_tok, cost, summary, str(ws.root), spec=spec)
-            # self-correct: hand the failure back to the same model
-            instruction = (
-                f"{task}\n\nYour previous attempt FAILED the check:\n"
-                f"{report.compact()}\nFix the code so the check passes."
+        if kind in AUTONOMOUS_KINDS:
+            agent = build_autonomous_agent(kind, model_override)
+            passed, attempt, in_tok, out_tok, summary = _autonomous_loop(
+                agent, ws, task, check, max_attempts
+            )
+        else:
+            agent = build_agent("executor", kind, model_override)
+            passed, attempt, in_tok, out_tok, summary = _completion_loop(
+                agent, ws, task, check, max_attempts
             )
 
         cost = in_tok / 1e6 * price.input_per_mtok + out_tok / 1e6 * price.output_per_mtok
-        return RacerResult(agent.name, False, attempt, in_tok, out_tok, cost, summary, str(ws.root), spec=spec)
+        return RacerResult(agent.name, passed, attempt, in_tok, out_tok, cost, summary, str(ws.root), spec=spec)
     except Exception as exc:  # one bad racer must not kill the whole race
         return RacerResult(spec, False, 0, 0, 0, 0.0, error=str(exc)[:300], workdir=str(workdir), spec=spec)
 

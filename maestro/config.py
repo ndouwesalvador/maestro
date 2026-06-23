@@ -22,6 +22,9 @@ PROVIDER_PRICES = {
     "anthropic": Price(5.0, 25.0),
     "claude-cli": Price(5.0, 25.0),   # Claude subscription (API-equivalent value)
     "codex-cli": Price(2.5, 10.0),    # ChatGPT/Codex subscription (API-equivalent)
+    "claude-code": Price(5.0, 25.0),  # Claude Code autonomous agent (subscription)
+    "codex": Price(2.5, 10.0),        # Codex autonomous agent (subscription)
+    "opencode": Price(0.0, 0.0),      # opencode autonomous agent (free models)
     "deepseek": Price(0.3, 1.2),      # DeepSeek API (cheap)
     "gemini": Price(0.0, 0.0),        # Gemini free tier
     "openrouter": Price(0.0, 0.0),    # OpenRouter free open-source models
@@ -113,3 +116,29 @@ def build_agent(role: str, kind: str, model_override: str = "") -> Agent:
 def price_for(kind: str) -> Price:
     """Per-token price for a provider (illustrative; see PROVIDER_PRICES)."""
     return PROVIDER_PRICES.get(kind.lower(), LOCAL_PRICE)
+
+
+# Providers that EDIT files themselves (full agent CLIs), vs completion backends
+# that return text Maestro applies.
+AUTONOMOUS_KINDS = {"claude-code", "codex", "opencode"}
+
+
+def build_autonomous_agent(kind: str, model_override: str = ""):
+    """Create an autonomous coding-agent backend (edits files in a directory)."""
+    kind = kind.lower()
+    if kind == "claude-code":
+        from .agents.autonomous import ClaudeCodeAgent
+
+        return ClaudeCodeAgent(model=model_override or _env("MAESTRO_CLAUDE_MODEL", ""))
+    if kind == "codex":
+        from .agents.autonomous import CodexAgent
+
+        return CodexAgent(model=model_override or _env("MAESTRO_CODEX_MODEL", ""))
+    if kind == "opencode":
+        from .agents.autonomous import OpencodeAgent
+
+        return OpencodeAgent(
+            model=model_override or _env("MAESTRO_OPENCODE_MODEL", ""),
+            timeout=int(_env("MAESTRO_OPENCODE_TIMEOUT", "240")),
+        )
+    raise SystemExit(f"Unknown autonomous backend '{kind}'. Use: claude-code | codex | opencode.")
