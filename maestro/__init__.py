@@ -5,4 +5,4 @@ local Executor does the bulk of the work. A token ledger shows how much of the
 paid-token cost was shifted onto the free model.
 """
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"

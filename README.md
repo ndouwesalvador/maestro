@@ -172,6 +172,25 @@ Tunable via `MAESTRO_AGENT_TIMEOUT`, `MAESTRO_AGENT_STALL`, `MAESTRO_AGENT_MAX_F
 And since each racer works on an **isolated copy**, a misbehaving agent can never
 touch your real repo. The stop reason is reported per racer.
 
+## Delegate from your AI agent — save ~95% of your tokens
+
+The whole point: if you drive an **expensive** agent (Claude Code, Codex), have it
+**delegate verifiable work to free agents** instead of doing it itself. One cheap
+command does the work and applies the winner back to your repo:
+
+```bash
+python -m maestro delegate --json \
+  --task "Fix the failing tests" \
+  --repo ./my-project \
+  --check "python -m pytest -q" \
+  --models "opencode:opencode/deepseek-v4-flash-free,ollama:gpt-oss:120b-cloud"
+# -> {"ok": true, "winner": "...", "check_passed": true, "applied_files": ["..."], ...}
+```
+
+The orchestrator spends tokens only on the task string and the one-line JSON — the
+free agents do all the file reading and editing, in parallel, under the watchdog.
+See **[AGENTS.md](AGENTS.md)** for the full playbook an orchestrator should follow.
+
 ## Web control room — `maestro serve`
 
 Prefer a UI? `maestro serve` opens a local dashboard (zero dependencies — just the

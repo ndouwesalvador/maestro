@@ -449,6 +449,35 @@ def cmd_race(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# delegate (offload work to free agents; for orchestrators like Claude/codex)
+# --------------------------------------------------------------------------- #
+def cmd_delegate(args) -> int:
+    _load_dotenv()
+    task = Path(args.task).read_text(encoding="utf-8") if Path(args.task).is_file() else args.task
+    models = [m.strip() for m in args.models.split(",") if m.strip()]
+
+    from .race import delegate
+
+    res = delegate(
+        models, args.repo, task, args.check, args.max_attempts,
+        apply=not args.no_apply, logger=(None if args.json else print),
+    )
+
+    if args.json:
+        print(json.dumps(res))
+        return 0 if res["ok"] else 1
+
+    if res["ok"]:
+        files = ", ".join(res["applied_files"]) or "(none)"
+        print(f"\n✓ delegated to {res['winner']} — check passed; applied {len(res['applied_files'])} file(s): {files}")
+        return 0
+    print("\n✗ no agent passed the check; nothing applied.")
+    for r in res["results"]:
+        print(f"  - {r['spec']}: {r['error'] or r['reason']}")
+    return 1
+
+
+# --------------------------------------------------------------------------- #
 # serve (web control room)
 # --------------------------------------------------------------------------- #
 def cmd_serve(args) -> int:
@@ -495,6 +524,16 @@ def main(argv=None) -> int:
     p_race.add_argument("--models", required=True, help="comma-separated providers, e.g. claude-cli,ollama,codex-cli")
     p_race.add_argument("--max-attempts", type=int, default=3)
 
+    p_del = sub.add_parser("delegate", help="offload a task to free agents in parallel and apply the winner (for orchestrators)")
+    p_del.add_argument("--task", required=True, help="task description, or path to a file")
+    p_del.add_argument("--repo", required=True, help="the real directory to fix (winner is applied here)")
+    p_del.add_argument("--check", required=True, help="shell command that exits 0 when the task is done")
+    p_del.add_argument("--models", default="opencode:opencode/deepseek-v4-flash-free,ollama:gpt-oss:120b-cloud",
+                       help="comma-separated free agents to race")
+    p_del.add_argument("--max-attempts", type=int, default=2)
+    p_del.add_argument("--no-apply", action="store_true", help="don't write changes back to the repo")
+    p_del.add_argument("--json", action="store_true", help="compact JSON output (for agents)")
+
     p_serve = sub.add_parser("serve", help="launch the web control room (dashboard)")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8765)
@@ -507,6 +546,8 @@ def main(argv=None) -> int:
         return cmd_run(args)
     if args.cmd == "race":
         return cmd_race(args)
+    if args.cmd == "delegate":
+        return cmd_delegate(args)
     if args.cmd == "serve":
         return cmd_serve(args)
     parser.print_help()

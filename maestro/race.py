@@ -10,6 +10,7 @@ objective check decide the winner.
 from __future__ import annotations
 
 import shutil
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -108,11 +109,11 @@ def _autonomous_loop(agent, ws, task, check, max_attempts, cancel=None, progress
 def _solo_run(spec, repo, task, check, max_attempts, cancel=None, on_event=None):
     """One model attempts the task on its own copy, self-correcting on failure."""
     kind, model_override = _parse_spec(spec)
-    workdir = Path(".maestro") / "race" / spec.replace(":", "_").replace("/", "_")
+    safe = spec.replace(":", "_").replace("/", "_")
+    # Unique per-run dir so a stale lock from a previous agent can never block us.
+    workdir = Path(".maestro") / "race" / f"{safe}-{uuid.uuid4().hex[:6]}"
     progress = (lambda info: on_event(spec, info)) if on_event else None
     try:
-        if workdir.exists():
-            shutil.rmtree(workdir)
         workdir.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(repo, workdir)
         ws = Workspace(workdir)
@@ -180,3 +181,51 @@ def pick_winner(results: List[RacerResult]) -> Optional[RacerResult]:
         return None
     winners.sort(key=lambda r: (r.cost, r.attempts, r.tokens))
     return winners[0]
+
+
+_APPLY_IGNORE = {".git", "__pycache__", ".pytest_cache", ".maestro", "node_modules", ".opencode"}
+
+
+def _apply_changed(src: Path, dst: Path) -> List[str]:
+    """Copy the files the winning agent changed (in its isolated copy) back into
+    the real repo. Returns the list of applied relative paths."""
+    changed: List[str] = []
+    for p in src.rglob("*"):
+        if p.is_dir():
+            continue
+        rel = p.relative_to(src)
+        if any(part in _APPLY_IGNORE for part in rel.parts):
+            continue
+        try:
+            data = p.read_bytes()
+        except OSError:
+            continue
+        target = dst / rel
+        if (not target.exists()) or target.read_bytes() != data:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            changed.append(str(rel).replace("\\", "/"))
+    return changed
+
+
+def delegate(models, repo, task, check, max_attempts=2, apply=True, logger=None, on_event=None) -> dict:
+    """Offload `task` to free agents in parallel; apply the cheapest passing result
+    back to the real repo. Returns a COMPACT dict so an orchestrator (Claude/codex)
+    can delegate work and read the outcome with almost no tokens."""
+    repo_path = Path(repo).resolve()
+    results = race(models, str(repo_path), task, check, max_attempts, logger=logger, on_event=on_event)
+    winner = pick_winner(results)
+    applied: List[str] = []
+    if winner and apply and winner.workdir:
+        applied = _apply_changed(Path(winner.workdir), repo_path)
+    return {
+        "ok": bool(winner),
+        "winner": winner.spec if winner else None,
+        "check_passed": bool(winner),
+        "applied_files": applied,
+        "results": [
+            {"model": r.model, "spec": r.spec, "reason": r.reason, "passed": r.passed,
+             "attempts": r.attempts, "tokens": r.tokens, "cost": round(r.cost, 5), "error": r.error}
+            for r in results
+        ],
+    }
