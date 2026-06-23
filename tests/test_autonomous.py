@@ -16,11 +16,12 @@ def test_autonomous_loop_fixes_and_passes(tmp_path):
     ws = Workspace(tmp_path)
     agent = MockAutonomousAgent({"math_utils.py": _FIXED})
 
-    passed, attempts, in_tok, out_tok, summary = _autonomous_loop(
+    passed, reason, attempts, in_tok, out_tok, summary = _autonomous_loop(
         agent, ws, "fix factorial", f'"{sys.executable}" check.py', 3
     )
 
     assert passed
+    assert reason == "passed"
     assert attempts == 1
     assert (tmp_path / "math_utils.py").read_text(encoding="utf-8") == _FIXED
 
@@ -55,6 +56,16 @@ def test_watchdog_timeout(tmp_path):
     (tmp_path / "spin.py").write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
     res = run_supervised([sys.executable, "spin.py"], tmp_path, timeout=2, poll=0.5)
     assert res.reason == "timeout"
+
+
+def test_watchdog_stops_on_cancel(tmp_path):
+    import threading
+
+    (tmp_path / "spin.py").write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
+    ev = threading.Event()
+    threading.Timer(1.0, ev.set).start()  # request stop after ~1s
+    res = run_supervised([sys.executable, "spin.py"], tmp_path, timeout=30, poll=0.4, should_stop=ev.is_set)
+    assert res.reason == "stopped"
 
 
 def test_watchdog_runaway_files(tmp_path):

@@ -82,6 +82,7 @@ def run_supervised(
     stall=None,
     max_files=None,
     poll: float = 4.0,
+    should_stop=None,
 ) -> SupervisedResult:
     """Run an agent CLI under a watchdog. Always returns (and always leaves no
     process behind), stopping on the first trigger above."""
@@ -111,6 +112,9 @@ def run_supervised(
             seen_change = False
             last_snap = base
             while True:
+                if should_stop and should_stop():
+                    reason = "stopped"
+                    break
                 if check and run_check(check, cwd).passed:
                     reason = "passed"
                     break
@@ -162,8 +166,9 @@ class AutonomousAgent(ABC):
     model: str = ""
 
     @abstractmethod
-    def act(self, task: str, workdir, check: str = "") -> ActResult:
-        """Edit files under `workdir` to accomplish `task`, under the watchdog."""
+    def act(self, task: str, workdir, check: str = "", cancel=None) -> ActResult:
+        """Edit files under `workdir` to accomplish `task`, under the watchdog.
+        `cancel()` -> True asks the watchdog to stop the agent."""
         raise NotImplementedError
 
 
@@ -174,11 +179,11 @@ class ClaudeCodeAgent(AutonomousAgent):
         self.model = model
         self.name = "claude-code" + (f":{model}" if model else "")
 
-    def act(self, task: str, workdir, check: str = "") -> ActResult:
+    def act(self, task: str, workdir, check: str = "", cancel=None) -> ActResult:
         cmd = _resolve("claude") + ["-p", "--output-format", "json", "--dangerously-skip-permissions"]
         if self.model:
             cmd += ["--model", self.model]
-        res = run_supervised(cmd, workdir, stdin_text=task, check=check)
+        res = run_supervised(cmd, workdir, stdin_text=task, check=check, should_stop=cancel)
         text, usage = _parse_claude_json(res.output)
         return ActResult(usage, (text or "").strip()[:120] or res.reason, res.output, res.reason)
 
@@ -190,12 +195,12 @@ class CodexAgent(AutonomousAgent):
         self.model = model
         self.name = "codex" + (f":{model}" if model else "")
 
-    def act(self, task: str, workdir, check: str = "") -> ActResult:
+    def act(self, task: str, workdir, check: str = "", cancel=None) -> ActResult:
         cmd = _resolve("codex") + ["exec", "--sandbox", "workspace-write"]
         if self.model:
             cmd += ["-m", self.model]
         cmd += ["-"]
-        res = run_supervised(cmd, workdir, stdin_text=task, check=check)
+        res = run_supervised(cmd, workdir, stdin_text=task, check=check, should_stop=cancel)
         return ActResult(
             Usage(estimate_tokens(task), estimate_tokens(res.output)),
             (res.output.strip()[-120:] or res.reason), res.output, res.reason,
@@ -209,12 +214,12 @@ class OpencodeAgent(AutonomousAgent):
         self.model = model
         self.name = "opencode" + (f":{model}" if model else "")
 
-    def act(self, task: str, workdir, check: str = "") -> ActResult:
+    def act(self, task: str, workdir, check: str = "", cancel=None) -> ActResult:
         cmd = _resolve("opencode") + ["run", "--dir", str(workdir)]
         if self.model:
             cmd += ["-m", self.model]
         cmd += [task]
-        res = run_supervised(cmd, workdir, check=check)
+        res = run_supervised(cmd, workdir, check=check, should_stop=cancel)
         return ActResult(Usage(estimate_tokens(task), 50), res.reason, res.output, res.reason)
 
 
@@ -226,7 +231,7 @@ class MockAutonomousAgent(AutonomousAgent):
         self.name = name
         self.model = "mock"
 
-    def act(self, task: str, workdir, check: str = "") -> ActResult:
+    def act(self, task: str, workdir, check: str = "", cancel=None) -> ActResult:
         wd = Path(workdir)
         for rel, content in self._files.items():
             (wd / rel).write_text(content, encoding="utf-8")

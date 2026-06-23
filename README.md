@@ -183,6 +183,10 @@ highlighted.
 maestro serve            # opens http://127.0.0.1:8765
 ```
 
+Pick the working folder with a **built-in file browser** (no path typing),
+**Stop** any model mid-run with one click, and watch each racer's live badge —
+including the watchdog reason (`runaway` / `stalled` / `timeout`).
+
 ## How the savings are measured (honestly)
 
 Maestro never hides the math. The ledger computes:

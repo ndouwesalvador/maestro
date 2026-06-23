@@ -1,62 +1,97 @@
-"""A tiny zero-dependency web 'control room' for `race`.
+"""A zero-dependency web 'control room' for `race`.
 
-`maestro serve` starts a local HTTP server (standard library only) that lets you
-launch a parallel race from the browser and watch each model work in real time —
-status, attempts, tokens and cost updating live, with the winner highlighted.
+`maestro serve` starts a local HTTP server (standard library only) that lets you:
+  - browse the filesystem to pick a working directory (no copy-pasting paths),
+  - launch a parallel race and watch each model live (status, attempts, tokens,
+    cost, and the watchdog reason: runaway / stalled / timeout),
+  - stop any model the instant it goes off the rails.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import string
 import threading
 import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .race import pick_winner, race
 
-# run_id -> live state dict (read by the browser via /api/status)
-_RUNS: dict = {}
+_RUNS: dict = {}    # run_id -> live state
+_STOPS: dict = {}   # run_id -> {spec: threading.Event}
+
+
+def _list_dir(path: str) -> dict:
+    """List subdirectories of a server-side path (for the folder picker)."""
+    p = Path(path) if path else Path.home()
+    try:
+        p = p.resolve()
+    except Exception:
+        p = Path.home()
+    drives = []
+    if os.name == "nt":
+        try:
+            drives = list(os.listdrives())
+        except Exception:
+            drives = [f"{c}:\\" for c in string.ascii_uppercase if os.path.exists(f"{c}:\\")]
+    try:
+        dirs = sorted(
+            (c.name for c in p.iterdir() if c.is_dir() and not c.name.startswith(".")),
+            key=str.lower,
+        )
+    except Exception as exc:
+        return {"path": str(p), "parent": str(p.parent), "dirs": [], "drives": drives, "error": str(exc)}
+    parent = str(p.parent) if p.parent != p else None
+    return {"path": str(p), "parent": parent, "dirs": dirs, "drives": drives}
 
 
 def _run_race(rid: str, payload: dict, models: list) -> None:
     state = _RUNS[rid]
+    stops = _STOPS[rid]
+
+    def cancel(spec: str) -> bool:
+        ev = stops.get(spec)
+        return bool(ev and ev.is_set())
+
+    def on_event(spec: str, info: dict) -> None:
+        racer = state["racers"].get(spec)
+        if racer:
+            racer.update(info)
 
     def on_result(r) -> None:
-        status = "pass" if r.passed else ("err" if r.error else "fail")
         state["racers"][r.spec] = {
             "spec": r.spec,
             "model": r.model,
-            "status": status,
+            "status": "done",
+            "reason": r.reason or ("passed" if r.passed else "failed"),
             "passed": r.passed,
             "attempts": r.attempts,
             "tokens": r.tokens,
             "cost": round(r.cost, 5),
-            "note": (r.error or r.summary or "")[:140],
+            "note": (r.error or r.summary or "")[:160],
             "workdir": r.workdir,
         }
 
     try:
         results = race(
-            models,
-            payload["repo"],
-            payload["task"],
-            payload["check"],
+            models, payload["repo"], payload["task"], payload["check"],
             int(payload.get("max_attempts", 3) or 3),
-            logger=None,
-            on_result=on_result,
+            on_result=on_result, cancel=cancel, on_event=on_event,
         )
         winner = pick_winner(results)
         state["winner"] = winner.spec if winner else None
-    except Exception as exc:  # surface setup errors to the UI
+    except Exception as exc:
         state["error"] = str(exc)[:300]
     finally:
         state["done"] = True
 
 
 class _Handler(BaseHTTPRequestHandler):
-    def log_message(self, *args):  # keep the console quiet
+    def log_message(self, *args):
         pass
 
     def _send(self, code: int, body, ctype: str = "application/json") -> None:
@@ -69,44 +104,63 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         route = urlparse(self.path)
+        q = parse_qs(route.query)
         if route.path == "/":
             self._send(200, _PAGE, "text/html; charset=utf-8")
+        elif route.path == "/api/ls":
+            self._send(200, json.dumps(_list_dir((q.get("path") or [""])[0])))
         elif route.path == "/api/status":
-            rid = (parse_qs(route.query).get("id") or [""])[0]
+            rid = (q.get("id") or [""])[0]
             self._send(200, json.dumps(_RUNS.get(rid, {"error": "unknown id"})))
         else:
             self._send(404, json.dumps({"error": "not found"}))
 
     def do_POST(self):
-        if urlparse(self.path).path != "/api/race":
-            self._send(404, json.dumps({"error": "not found"}))
-            return
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        try:
-            payload = json.loads(self.rfile.read(length) or b"{}")
-        except json.JSONDecodeError:
-            self._send(400, json.dumps({"error": "bad json"}))
+        route = urlparse(self.path)
+        q = parse_qs(route.query)
+
+        if route.path == "/api/stop":
+            rid = (q.get("id") or [""])[0]
+            model = (q.get("model") or [""])[0]
+            stops = _STOPS.get(rid, {})
+            targets = [model] if model else list(stops.keys())
+            for spec in targets:
+                if spec in stops:
+                    stops[spec].set()
+            self._send(200, json.dumps({"ok": True, "stopped": targets}))
             return
 
-        models = [m.strip() for m in str(payload.get("models", "")).split(",") if m.strip()]
-        if not models or not payload.get("repo") or not payload.get("check"):
-            self._send(400, json.dumps({"error": "need repo, check and at least one model"}))
+        if route.path == "/api/race":
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            try:
+                payload = json.loads(self.rfile.read(length) or b"{}")
+            except json.JSONDecodeError:
+                self._send(400, json.dumps({"error": "bad json"}))
+                return
+            models = [m.strip() for m in str(payload.get("models", "")).split(",") if m.strip()]
+            repo = str(payload.get("repo", "")).strip()
+            if not models or not repo or not str(payload.get("check", "")).strip():
+                self._send(400, json.dumps({"error": "need a folder, a check command, and at least one model"}))
+                return
+            if not Path(repo).is_dir():
+                self._send(400, json.dumps({"error": f"not a folder: {repo}"}))
+                return
+
+            rid = uuid.uuid4().hex[:8]
+            _STOPS[rid] = {m: threading.Event() for m in models}
+            _RUNS[rid] = {
+                "id": rid, "done": False, "winner": None, "models": models,
+                "racers": {
+                    m: {"spec": m, "model": m, "status": "running", "reason": "",
+                        "attempts": 0, "tokens": 0, "cost": 0.0, "note": ""}
+                    for m in models
+                },
+            }
+            threading.Thread(target=_run_race, args=(rid, payload, models), daemon=True).start()
+            self._send(200, json.dumps({"id": rid}))
             return
 
-        rid = uuid.uuid4().hex[:8]
-        _RUNS[rid] = {
-            "id": rid,
-            "done": False,
-            "winner": None,
-            "models": models,
-            "racers": {
-                m: {"spec": m, "model": m, "status": "running", "attempts": 0,
-                    "tokens": 0, "cost": 0.0, "note": ""}
-                for m in models
-            },
-        }
-        threading.Thread(target=_run_race, args=(rid, payload, models), daemon=True).start()
-        self._send(200, json.dumps({"id": rid}))
+        self._send(404, json.dumps({"error": "not found"}))
 
 
 def serve(host: str = "127.0.0.1", port: int = 8765, open_browser: bool = True) -> None:
@@ -134,124 +188,189 @@ _PAGE = r"""<!doctype html>
 <title>Maestro — Control Room</title>
 <style>
   :root { --bg:#0d1117; --panel:#161b22; --line:#272e3a; --txt:#e6edf3; --mut:#8b949e;
-          --accent:#7c5cff; --pass:#2ea043; --fail:#d29922; --err:#6e7681; --run:#388bfd; }
+          --accent:#7c5cff; --pass:#2ea043; --fail:#d29922; --warn:#db6d28; --err:#f85149;
+          --run:#388bfd; --stop:#6e7681; }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--txt);
          font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
-  header { padding:18px 24px; border-bottom:1px solid var(--line); }
-  header h1 { margin:0; font-size:18px; letter-spacing:.5px; }
-  header h1 span { color:var(--accent); }
+  header { padding:16px 24px; border-bottom:1px solid var(--line); }
+  header h1 { margin:0; font-size:18px; } header h1 span { color:var(--accent); }
   header p { margin:4px 0 0; color:var(--mut); font-size:12px; }
-  main { display:grid; grid-template-columns:340px 1fr; gap:0; min-height:calc(100vh - 70px); }
-  form { padding:20px 24px; border-right:1px solid var(--line); }
+  main { display:grid; grid-template-columns:360px 1fr; min-height:calc(100vh - 66px); }
+  form { padding:18px 22px; border-right:1px solid var(--line); }
   label { display:block; font-size:11px; text-transform:uppercase; letter-spacing:.6px;
           color:var(--mut); margin:14px 0 5px; }
   input, textarea { width:100%; background:#0b0f14; color:var(--txt);
           border:1px solid var(--line); border-radius:7px; padding:8px 10px; font:inherit; }
-  textarea { resize:vertical; min-height:60px; }
-  button { margin-top:18px; width:100%; background:var(--accent); color:#fff; border:0;
-           border-radius:7px; padding:11px; font:inherit; font-weight:600; cursor:pointer; }
+  textarea { resize:vertical; min-height:54px; }
+  .row { display:flex; gap:8px; } .row input { flex:1; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:7px;
+           padding:9px 12px; font:inherit; font-weight:600; cursor:pointer; }
+  button.ghost { background:#21262d; color:var(--txt); border:1px solid var(--line); }
   button:disabled { opacity:.5; cursor:default; }
-  section { padding:20px 24px; }
+  #go { width:100%; margin-top:18px; padding:11px; }
+  section { padding:18px 22px; }
   .winner { background:linear-gradient(90deg,#15301c,#161b22); border:1px solid var(--pass);
             border-radius:9px; padding:12px 16px; margin-bottom:16px; display:none; }
-  .winner b { color:var(--pass); }
-  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:14px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); gap:14px; }
   .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
   .card .top { display:flex; align-items:center; justify-content:space-between; gap:8px; }
   .name { font-weight:600; word-break:break-all; }
   .badge { font-size:11px; padding:3px 9px; border-radius:20px; white-space:nowrap; }
-  .b-running { background:rgba(56,139,253,.15); color:var(--run); }
-  .b-pass { background:rgba(46,160,67,.15); color:var(--pass); }
-  .b-fail { background:rgba(210,153,34,.15); color:var(--fail); }
-  .b-err { background:rgba(110,118,129,.2); color:var(--err); }
-  .dot { display:inline-block; width:7px; height:7px; border-radius:50%; margin-right:6px; }
-  .b-running .dot { background:var(--run); animation:pulse 1s infinite; }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.25} }
-  .stats { display:flex; gap:18px; margin-top:12px; color:var(--mut); font-size:12px; }
-  .stats b { color:var(--txt); font-weight:600; }
-  .note { margin-top:10px; color:var(--mut); font-size:12px; min-height:16px; }
-  .empty { color:var(--mut); }
+  .b-running{background:rgba(56,139,253,.15);color:var(--run)}
+  .b-pass{background:rgba(46,160,67,.16);color:var(--pass)}
+  .b-fail{background:rgba(210,153,34,.16);color:var(--fail)}
+  .b-warn{background:rgba(219,109,40,.18);color:var(--warn)}
+  .b-err{background:rgba(248,81,73,.16);color:var(--err)}
+  .b-stop{background:rgba(110,118,129,.22);color:var(--stop)}
+  .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;background:currentColor}
+  .b-running .dot{animation:pulse 1s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+  .stats{display:flex;gap:16px;margin-top:12px;color:var(--mut);font-size:12px}
+  .stats b{color:var(--txt)}
+  .note{margin-top:9px;color:var(--mut);font-size:12px;min-height:15px;word-break:break-word}
+  .stopbtn{margin-top:10px;background:#3d1418;color:#ff9a90;border:1px solid #5b1a1f;font-size:12px;padding:5px 10px}
+  .empty{color:var(--mut)}
+  /* folder browser */
+  #fb{display:none;border:1px solid var(--line);border-radius:8px;margin-top:6px;background:#0b0f14}
+  #fbpath{padding:8px 10px;border-bottom:1px solid var(--line);color:var(--mut);font-size:12px;word-break:break-all}
+  #fblist{max-height:230px;overflow:auto}
+  .fbitem{padding:6px 10px;cursor:pointer;border-bottom:1px solid #1b2230}
+  .fbitem:hover{background:#161b22}
+  .fbbar{display:flex;gap:6px;flex-wrap:wrap;padding:8px 10px;border-top:1px solid var(--line)}
+  .fbbar button{font-size:12px;padding:5px 9px}
+  .drive{background:#21262d;color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:3px 8px;font-size:11px;cursor:pointer;margin:0 4px 4px 0}
 </style>
 </head>
 <body>
 <header>
   <h1>🎼 Maestro <span>Control Room</span></h1>
-  <p>Launch several models in parallel on the same task — cheapest one that passes wins.</p>
+  <p>Pick a real folder, race several models in parallel, and stop any one that misbehaves.</p>
 </header>
 <main>
   <form id="f">
     <label>Task</label>
     <textarea id="task">Fix the failing tests by correcting the bug in the source.</textarea>
-    <label>Repo (absolute path)</label>
-    <input id="repo" placeholder="C:\path\to\project">
+
+    <label>Working folder</label>
+    <div class="row">
+      <input id="repo" placeholder="(none selected)" readonly>
+      <button type="button" class="ghost" id="browse">Browse…</button>
+    </div>
+    <div id="fb">
+      <div id="fbpath"></div>
+      <div id="fblist"></div>
+      <div class="fbbar">
+        <button type="button" class="ghost" id="fbup">⬆ Up</button>
+        <button type="button" id="fbuse">✓ Use this folder</button>
+        <button type="button" class="ghost" id="fbclose">Cancel</button>
+        <span id="fbdrives"></span>
+      </div>
+    </div>
+
     <label>Check command (exit 0 = done)</label>
     <input id="check" value="python -m pytest -q">
     <label>Models (comma-separated)</label>
-    <input id="models" value="ollama:gpt-oss:120b-cloud">
+    <input id="models" value="opencode:opencode/deepseek-v4-flash-free,ollama:gpt-oss:120b-cloud">
     <label>Max attempts</label>
     <input id="max" type="number" value="3" min="1" max="8">
     <button id="go" type="submit">▶ Lancer la course</button>
   </form>
+
   <section>
     <div class="winner" id="winner"></div>
-    <div class="grid" id="grid"><p class="empty">No race yet. Configure on the left and launch.</p></div>
+    <div class="grid" id="grid"><p class="empty">No race yet. Pick a folder and launch.</p></div>
   </section>
 </main>
 <script>
   const $ = id => document.getElementById(id);
-  let timer = null;
+  const esc = s => (s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+  let timer=null, runId=null, browsePath="";
 
-  $("f").addEventListener("submit", async (e) => {
+  // ---- folder browser ----
+  $("browse").onclick = () => { $("fb").style.display="block"; loadDir($("repo").value||""); };
+  $("fbclose").onclick = () => { $("fb").style.display="none"; };
+  $("fbup").onclick = () => { if (browseParent!==null) loadDir(browseParent); };
+  $("fbuse").onclick = () => { $("repo").value=browsePath; $("fb").style.display="none"; };
+  let browseParent=null;
+  async function loadDir(path){
+    const r = await fetch("/api/ls?path="+encodeURIComponent(path||""));
+    const d = await r.json();
+    browsePath = d.path; browseParent = d.parent;
+    $("fbpath").textContent = d.error ? (d.path+"  ("+d.error+")") : d.path;
+    $("fblist").innerHTML = (d.dirs||[]).map(name =>
+      `<div class="fbitem" data-n="${esc(name)}">📁 ${esc(name)}</div>`).join("")
+      || '<div class="fbitem empty">(no sub-folders)</div>';
+    $("fblist").querySelectorAll(".fbitem[data-n]").forEach(el=>{
+      el.onclick = () => loadDir(joinPath(d.path, el.getAttribute("data-n")));
+    });
+    $("fbdrives").innerHTML = (d.drives||[]).map(dr =>
+      `<span class="drive" data-d="${esc(dr)}">${esc(dr)}</span>`).join("");
+    $("fbdrives").querySelectorAll(".drive").forEach(el=>{
+      el.onclick = () => loadDir(el.getAttribute("data-d"));
+    });
+  }
+  function joinPath(base, name){
+    const sep = base.includes("\\") ? "\\" : "/";
+    return base.endsWith(sep) ? base+name : base+sep+name;
+  }
+
+  // ---- race ----
+  $("f").addEventListener("submit", async e => {
     e.preventDefault();
-    $("go").disabled = true;
-    $("winner").style.display = "none";
-    const body = {
-      task: $("task").value, repo: $("repo").value, check: $("check").value,
-      models: $("models").value, max_attempts: parseInt($("max").value || "3"),
-    };
-    const r = await fetch("/api/race", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
-    const j = await r.json();
-    if (j.error) { alert(j.error); $("go").disabled = false; return; }
-    if (timer) clearInterval(timer);
-    timer = setInterval(() => poll(j.id), 900);
-    poll(j.id);
+    if(!$("repo").value){ alert("Pick a working folder first."); return; }
+    $("go").disabled=true; $("winner").style.display="none";
+    const body={task:$("task").value,repo:$("repo").value,check:$("check").value,
+      models:$("models").value,max_attempts:parseInt($("max").value||"3")};
+    const r=await fetch("/api/race",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    const j=await r.json();
+    if(j.error){ alert(j.error); $("go").disabled=false; return; }
+    runId=j.id;
+    if(timer) clearInterval(timer);
+    timer=setInterval(()=>poll(runId),900); poll(runId);
   });
 
-  async function poll(id) {
-    const r = await fetch("/api/status?id=" + id);
-    const s = await r.json();
+  async function poll(id){
+    const s = await (await fetch("/api/status?id="+id)).json();
     render(s);
-    if (s.done) { clearInterval(timer); $("go").disabled = false; }
+    if(s.done){ clearInterval(timer); $("go").disabled=false; }
   }
 
-  function render(s) {
-    const racers = Object.values(s.racers || {});
-    $("grid").innerHTML = racers.map(card).join("") || '<p class="empty">starting…</p>';
-    const w = $("winner");
-    if (s.done && s.winner) {
-      const win = s.racers[s.winner];
-      w.style.display = "block";
-      w.innerHTML = `🏆 <b>WINNER:</b> ${esc(win.model)} — cheapest passing, $${(win.cost||0).toFixed(4)}`;
-    } else if (s.done && s.error) {
-      w.style.display = "block"; w.innerHTML = "⚠ " + esc(s.error);
-    } else if (s.done) {
-      w.style.display = "block"; w.innerHTML = "No model passed the check.";
-    }
+  function badge(c){
+    if(c.status!=="done") return ["b-running","running · try "+(c.attempts||0)];
+    const r=c.reason||(c.passed?"passed":"failed");
+    if(r==="passed") return ["b-pass","PASS"];
+    if(r==="stopped") return ["b-stop","stopped"];
+    if(r==="error") return ["b-err","error"];
+    if(["runaway","stalled","timeout"].includes(r)) return ["b-warn","⚠ "+r];
+    return ["b-fail","failed"];
   }
 
-  function card(c) {
-    const map = {running:"b-running",pass:"b-pass",fail:"b-fail",err:"b-err"};
-    const label = {running:"running",pass:"PASS",fail:"failed",err:"error"};
-    return `<div class="card">
-      <div class="top"><span class="name">${esc(c.model||c.spec)}</span>
-        <span class="badge ${map[c.status]||'b-err'}"><span class="dot"></span>${label[c.status]||c.status}</span></div>
-      <div class="stats"><span>attempts <b>${c.attempts||0}</b></span>
-        <span>tokens <b>${c.tokens||0}</b></span><span>cost <b>$${(c.cost||0).toFixed(4)}</b></span></div>
-      <div class="note">${esc(c.note||"")}</div>
-    </div>`;
+  function render(s){
+    const racers=Object.values(s.racers||{});
+    $("grid").innerHTML = racers.map(c=>{
+      const [cls,label]=badge(c);
+      const stop = c.status!=="done"
+        ? `<button class="stopbtn" data-s="${esc(c.spec)}">■ Stop</button>` : "";
+      return `<div class="card"><div class="top">
+        <span class="name">${esc(c.model||c.spec)}</span>
+        <span class="badge ${cls}"><span class="dot"></span>${label}</span></div>
+        <div class="stats"><span>attempts <b>${c.attempts||0}</b></span>
+          <span>tokens <b>${c.tokens||0}</b></span>
+          <span>cost <b>$${(c.cost||0).toFixed(4)}</b></span></div>
+        <div class="note">${esc(c.note||"")}</div>${stop}</div>`;
+    }).join("") || '<p class="empty">starting…</p>';
+    $("grid").querySelectorAll(".stopbtn").forEach(b=>{
+      b.onclick=()=>{ b.textContent="stopping…"; b.disabled=true;
+        fetch("/api/stop?id="+runId+"&model="+encodeURIComponent(b.getAttribute("data-s")),{method:"POST"}); };
+    });
+    const w=$("winner");
+    if(s.done && s.winner && s.racers[s.winner]){
+      const win=s.racers[s.winner]; w.style.display="block";
+      w.innerHTML=`🏆 <b>WINNER:</b> ${esc(win.model)} — cheapest passing, $${(win.cost||0).toFixed(4)}`;
+    } else if(s.done && s.error){ w.style.display="block"; w.textContent="⚠ "+s.error; }
+    else if(s.done){ w.style.display="block"; w.textContent="No model passed the check."; }
   }
-  const esc = s => (s||"").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 </script>
 </body>
 </html>

@@ -434,9 +434,9 @@ def cmd_race(args) -> int:
 
     print("\n+---------------------- RACE RESULTS ----------------------+")
     for r in sorted(results, key=lambda r: (not r.passed, r.cost, r.tokens)):
-        status = "PASS" if r.passed else ("ERR " if r.error else "fail")
+        status = "PASS" if r.passed else (r.reason or ("ERR" if r.error else "fail"))
         note = r.error or r.summary
-        print(f"  {status}  {r.model:<22} tokens={r.tokens:<7} cost=${r.cost:.4f}  {note[:40]}")
+        print(f"  {status:<8} {r.model:<22} tokens={r.tokens:<7} cost=${r.cost:.4f}  {note[:38]}")
     print("+----------------------------------------------------------+")
 
     winner = pick_winner(results)
