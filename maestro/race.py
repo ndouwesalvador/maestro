@@ -9,6 +9,7 @@ objective check decide the winner.
 
 from __future__ import annotations
 
+import os
 import shutil
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -106,6 +107,28 @@ def _autonomous_loop(agent, ws, task, check, max_attempts, cancel=None, progress
     return False, "failed", attempt, in_tok, out_tok, summary
 
 
+_COPY_IGNORE = ("node_modules", ".next", ".git", ".maestro", "dist", "build",
+                ".turbo", ".cache", "__pycache__", ".venv", "venv", ".pytest_cache")
+
+
+def _provision_deps(repo: Path, workdir: Path) -> None:
+    """Make heavy dependency dirs (node_modules) available in the copy without a
+    full data copy: hardlink them (same volume) so checks like `tsc` work, the
+    copy stays cheap, and deleting the copy NEVER touches the real deps. Falls
+    back to a real copy if hardlinking isn't possible."""
+    src = repo / "node_modules"
+    if not src.is_dir():
+        return
+    dst = workdir / "node_modules"
+    try:
+        shutil.copytree(src, dst, copy_function=os.link, dirs_exist_ok=True)
+    except Exception:
+        try:
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+        except Exception:
+            pass
+
+
 def _solo_run(spec, repo, task, check, max_attempts, cancel=None, on_event=None):
     """One model attempts the task on its own copy, self-correcting on failure."""
     kind, model_override = _parse_spec(spec)
@@ -115,7 +138,10 @@ def _solo_run(spec, repo, task, check, max_attempts, cancel=None, on_event=None)
     progress = (lambda info: on_event(spec, info)) if on_event else None
     try:
         workdir.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(repo, workdir)
+        # Copy the SOURCE only (isolated — edits never touch the real repo);
+        # heavy deps are hardlinked separately so the copy stays fast.
+        shutil.copytree(repo, workdir, ignore=shutil.ignore_patterns(*_COPY_IGNORE))
+        _provision_deps(repo, workdir)
         ws = Workspace(workdir)
         price = price_for(kind)
 
