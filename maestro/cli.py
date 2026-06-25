@@ -478,6 +478,34 @@ def cmd_delegate(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# auto (decompose a goal -> delegate each sub-task to free agents)
+# --------------------------------------------------------------------------- #
+def cmd_auto(args) -> int:
+    _load_dotenv()
+    goal = Path(args.goal).read_text(encoding="utf-8") if Path(args.goal).is_file() else args.goal
+    models = [m.strip() for m in args.models.split(",") if m.strip()]
+
+    from .auto import auto_run
+
+    res = auto_run(goal, args.repo, args.orchestrator, models, args.max_attempts,
+                   logger=(None if args.json else print))
+
+    if args.json:
+        print(json.dumps(res))
+        return 0 if res["ok"] else 1
+
+    print("\n+----------------------- AUTO RESULTS ----------------------+")
+    for s in res["steps"]:
+        tag = "OK  " if s["ok"] else "FAIL"
+        files = ("-> " + ", ".join(s["applied_files"])) if s["applied_files"] else ""
+        print(f"  {tag}  {s['title'][:38]:<38} {files[:30]}")
+    print("+-----------------------------------------------------------+")
+    passed = sum(1 for s in res["steps"] if s["ok"])
+    print(f"\nRESULT: {'SUCCESS' if res['ok'] else 'INCOMPLETE'} ({passed}/{len(res['steps'])} sub-tasks)")
+    return 0 if res["ok"] else 1
+
+
+# --------------------------------------------------------------------------- #
 # serve (web control room)
 # --------------------------------------------------------------------------- #
 def cmd_serve(args) -> int:
@@ -534,6 +562,16 @@ def main(argv=None) -> int:
     p_del.add_argument("--no-apply", action="store_true", help="don't write changes back to the repo")
     p_del.add_argument("--json", action="store_true", help="compact JSON output (for agents)")
 
+    p_auto = sub.add_parser("auto", help="decompose a goal into sub-tasks and delegate each to free agents")
+    p_auto.add_argument("--goal", required=True, help="high-level objective, or path to a file")
+    p_auto.add_argument("--repo", required=True)
+    p_auto.add_argument("--orchestrator", default="ollama:gpt-oss:120b-cloud",
+                        help="completion model that plans (claude-cli, codex-cli, ollama:..., deepseek, ...)")
+    p_auto.add_argument("--models", default="opencode:opencode/deepseek-v4-flash-free,ollama:gpt-oss:120b-cloud",
+                        help="free agents that execute each sub-task")
+    p_auto.add_argument("--max-attempts", type=int, default=2)
+    p_auto.add_argument("--json", action="store_true")
+
     p_serve = sub.add_parser("serve", help="launch the web control room (dashboard)")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8765)
@@ -548,6 +586,8 @@ def main(argv=None) -> int:
         return cmd_race(args)
     if args.cmd == "delegate":
         return cmd_delegate(args)
+    if args.cmd == "auto":
+        return cmd_auto(args)
     if args.cmd == "serve":
         return cmd_serve(args)
     parser.print_help()
