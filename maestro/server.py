@@ -86,7 +86,7 @@ def _run_auto(rid: str, payload: dict, models: list) -> None:
     def on_plan(steps):
         state["steps"] = [
             {"title": s["title"], "task": s["task"], "check": s["check"],
-             "status": "pending", "winner": None, "applied_files": []}
+             "status": "pending", "winner": None, "applied_files": [], "results": []}
             for s in steps
         ]
 
@@ -262,6 +262,8 @@ _PAGE = r"""<!doctype html>
   .stats{display:flex;gap:16px;margin-top:12px;color:var(--mut);font-size:12px}
   .stats b{color:var(--txt)}
   .note{margin-top:9px;color:var(--mut);font-size:12px;min-height:15px;word-break:break-word}
+  .hint{margin:6px 0 0;color:var(--mut);font-size:11px;line-height:1.5}
+  .hint code{background:#0b0f14;border:1px solid var(--line);border-radius:4px;padding:1px 4px;color:var(--txt)}
   .stopbtn{margin-top:10px;background:#3d1418;color:#ff9a90;border:1px solid #5b1a1f;font-size:12px;padding:5px 10px}
   .empty{color:var(--mut)}
   #fb{display:none;border:1px solid var(--line);border-radius:8px;margin-top:6px;background:#0b0f14}
@@ -314,11 +316,33 @@ _PAGE = r"""<!doctype html>
       <label>Goal (objectif global)</label>
       <textarea id="goal">Fix every TypeScript error reported by tsc.</textarea>
       <label>Orchestrator (modèle qui planifie)</label>
-      <input id="orchestrator" value="ollama:gpt-oss:120b-cloud">
+      <input id="orchestrator" list="providerList" value="ollama:gpt-oss:120b-cloud">
     </div>
 
     <label>Models (agents, comma-separated)</label>
-    <input id="models" value="opencode:opencode/deepseek-v4-flash-free,ollama:gpt-oss:120b-cloud">
+    <input id="models" list="providerList" value="opencode:opencode/deepseek-v4-flash-free,ollama:gpt-oss:120b-cloud">
+    <p class="hint">Pick from the dropdown (start typing to see it) or write your own
+      <code>provider:model</code>, comma-separated. Subscription, no API key — run this
+      app from a terminal/session where you're already signed in: <code>claude-cli</code>,
+      <code>claude-code</code>, <code>codex-cli</code>, <code>codex</code>. Free:
+      <code>opencode:&lt;model&gt;</code>, <code>ollama:&lt;model&gt;</code>. Needs an API key:
+      <code>deepseek</code>, <code>gemini</code>, <code>openrouter</code>, <code>anthropic</code>,
+      <code>openai</code>.</p>
+    <datalist id="providerList">
+      <option value="claude-cli">
+      <option value="claude-code">
+      <option value="codex-cli">
+      <option value="codex">
+      <option value="opencode:opencode/deepseek-v4-flash-free">
+      <option value="opencode:opencode/grok-code-free">
+      <option value="ollama:gpt-oss:120b-cloud">
+      <option value="ollama:llama3">
+      <option value="deepseek:deepseek-chat">
+      <option value="gemini:gemini-2.0-flash">
+      <option value="openrouter:deepseek/deepseek-chat-v3-0324:free">
+      <option value="anthropic:claude-opus-4-8">
+      <option value="openai:gpt-4o-mini">
+    </datalist>
     <label>Max attempts</label>
     <input id="max" type="number" value="3" min="1" max="8">
     <button id="go" type="submit">▶ Lancer</button>
@@ -405,12 +429,17 @@ _PAGE = r"""<!doctype html>
       $("grid").innerHTML = steps.length ? steps.map((st,i)=>{
         const [cls,label]=stepBadge(st.status);
         const files = (st.applied_files&&st.applied_files.length)?("applied: "+st.applied_files.join(", ")):"";
+        const breakdown = (st.results||[]).map(r=>
+          esc(r.spec||r.model)+" → "+esc(r.reason||(r.passed?"passed":"failed"))+
+          (r.error?" ("+esc(r.error.slice(0,80))+")":"")
+        ).join("<br>");
         return `<div class="card"><div class="top"><span class="name">${i+1}. ${esc(st.title)}</span>
           <span class="badge ${cls}"><span class="dot"></span>${label}</span></div>
           <div class="note">${esc(st.task||"")}</div>
           <div class="stats"><span>check <b>${esc(st.check||"")}</b></span></div>
-          <div class="note">${esc(st.winner?("✓ "+st.winner+"  "):"")}${esc(files)}</div></div>`;
-      }).join("") : '<p class="empty">planning…</p>';
+          <div class="note">${esc(st.winner?("✓ "+st.winner+"  "):"")}${esc(files)}</div>
+          ${breakdown?`<div class="note">${breakdown}</div>`:""}</div>`;
+      }).join("") : (s.done ? '<p class="empty">No checkable sub-task was planned — try a more specific goal, or pick a different orchestrator.</p>' : '<p class="empty">planning…</p>');
       if(s.done){ w.style.display="block";
         w.innerHTML = s.error ? ("⚠ "+esc(s.error))
           : (s.ok ? "🏆 <b>SUCCESS</b> — toutes les sous-tâches sont passées et appliquées."

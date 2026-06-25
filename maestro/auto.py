@@ -30,7 +30,13 @@ AUTO_PLAN_SYS = (
 
 def _plan(orchestrator, goal: str, tree: str) -> List[dict]:
     resp = orchestrator.chat(AUTO_PLAN_SYS, f"GOAL:\n{goal}\n\nFILE TREE:\n{tree}\n")
-    data = _extract_json(resp.text)
+    try:
+        data = _extract_json(resp.text)
+    except Exception as exc:
+        raise RuntimeError(
+            f"orchestrator '{orchestrator.name}' did not return valid JSON ({exc}); "
+            f"it replied: {resp.text[:200]!r}"
+        ) from exc
     steps = []
     for s in data.get("steps", []):
         if s.get("task") and s.get("check"):
@@ -71,11 +77,13 @@ def auto_run(
         log(f"[auto] step {i + 1}/{len(steps)}: {s['title']}")
         res = delegate(executor_specs, str(repo_path), s["task"], s["check"],
                        max_attempts, apply=True, logger=logger)
-        row = {**s, "ok": res["ok"], "winner": res["winner"], "applied_files": res["applied_files"]}
+        row = {**s, "ok": res["ok"], "winner": res["winner"], "applied_files": res["applied_files"],
+               "results": res["results"]}
         results.append(row)
         if on_step:
             on_step(i, {"status": "done" if res["ok"] else "failed",
-                        "winner": res["winner"], "applied_files": res["applied_files"]})
+                        "winner": res["winner"], "applied_files": res["applied_files"],
+                        "results": res["results"]})
 
     return {
         "goal": goal,
