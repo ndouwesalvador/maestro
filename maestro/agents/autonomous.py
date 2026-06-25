@@ -87,7 +87,7 @@ def run_supervised(
     """Run an agent CLI under a watchdog. Always returns (and always leaves no
     process behind), stopping on the first trigger above."""
     timeout = timeout or int(os.environ.get("MAESTRO_AGENT_TIMEOUT", "240"))
-    stall = stall or int(os.environ.get("MAESTRO_AGENT_STALL", "60"))
+    stall = stall or int(os.environ.get("MAESTRO_AGENT_STALL", "180"))
     max_files = max_files or int(os.environ.get("MAESTRO_AGENT_MAX_FILES", "40"))
 
     cwd = Path(cwd)

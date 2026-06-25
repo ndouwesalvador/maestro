@@ -206,6 +206,17 @@ Pick the working folder with a **built-in file browser** (no path typing),
 **Stop** any model mid-run with one click, and watch each racer's live badge —
 including the watchdog reason (`runaway` / `stalled` / `timeout`).
 
+### Desktop app (double-click `.exe`)
+
+Build a standalone Windows executable that opens the control room on launch (no
+Python needed on the target machine):
+
+```bash
+pip install pyinstaller
+pyinstaller --onefile --name Maestro app.py
+# -> dist/Maestro.exe   (double-click; the dashboard opens in your browser)
+```
+
 ## How the savings are measured (honestly)
 
 Maestro never hides the math. The ledger computes:

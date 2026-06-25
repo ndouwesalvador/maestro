@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "maestro-ai"
-version = "0.7.1"
+version = "0.7.2"
 description = "One frontier model conducts an orchestra of free local models — save ~90% of paid tokens by supervising a cheap local agent only when it diverges."
 readme = "README.md"
 requires-python = ">=3.9"
