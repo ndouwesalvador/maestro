@@ -159,7 +159,7 @@ def _solo_run(spec, repo, task, check, max_attempts, cancel=None, on_event=None)
         cost = in_tok / 1e6 * price.input_per_mtok + out_tok / 1e6 * price.output_per_mtok
         return RacerResult(agent.name, passed, attempt, in_tok, out_tok, cost,
                            summary, str(ws.root), reason=reason, spec=spec)
-    except Exception as exc:  # one bad racer must not kill the whole race
+    except (Exception, SystemExit) as exc:  # one bad racer must not kill the whole race
         return RacerResult(spec, False, 0, 0, 0, 0.0, error=str(exc)[:300],
                            workdir=str(workdir), reason="error", spec=spec)
 

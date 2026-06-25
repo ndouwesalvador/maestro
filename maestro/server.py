@@ -74,7 +74,7 @@ def _run_race(rid: str, payload: dict, models: list) -> None:
                        on_result=on_result, cancel=cancel, on_event=on_event)
         winner = pick_winner(results)
         state["winner"] = winner.spec if winner else None
-    except Exception as exc:
+    except (Exception, SystemExit) as exc:
         state["error"] = str(exc)[:300]
     finally:
         state["done"] = True
@@ -104,7 +104,7 @@ def _run_auto(rid: str, payload: dict, models: list) -> None:
             on_plan=on_plan, on_step=on_step,
         )
         state["ok"] = res["ok"]
-    except Exception as exc:
+    except (Exception, SystemExit) as exc:
         state["error"] = str(exc)[:300]
     finally:
         state["done"] = True
@@ -264,6 +264,11 @@ _PAGE = r"""<!doctype html>
   .note{margin-top:9px;color:var(--mut);font-size:12px;min-height:15px;word-break:break-word}
   .hint{margin:6px 0 0;color:var(--mut);font-size:11px;line-height:1.5}
   .hint code{background:#0b0f14;border:1px solid var(--line);border-radius:4px;padding:1px 4px;color:var(--txt)}
+  .chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+  .chip{background:#21262d;color:var(--txt);border:1px solid var(--line);border-radius:20px;
+        padding:4px 10px;font-size:11px;cursor:pointer;user-select:none}
+  .chip:hover{border-color:var(--accent)}
+  .chip.on{background:var(--accent);color:#fff;border-color:var(--accent)}
   .stopbtn{margin-top:10px;background:#3d1418;color:#ff9a90;border:1px solid #5b1a1f;font-size:12px;padding:5px 10px}
   .empty{color:var(--mut)}
   #fb{display:none;border:1px solid var(--line);border-radius:8px;margin-top:6px;background:#0b0f14}
@@ -316,33 +321,18 @@ _PAGE = r"""<!doctype html>
       <label>Goal (objectif global)</label>
       <textarea id="goal">Fix every TypeScript error reported by tsc.</textarea>
       <label>Orchestrator (modèle qui planifie)</label>
-      <input id="orchestrator" list="providerList" value="ollama:gpt-oss:120b-cloud">
+      <input id="orchestrator" value="ollama:gpt-oss:120b-cloud">
+      <div class="chips" id="orchChips"></div>
     </div>
 
-    <label>Models (agents, comma-separated)</label>
-    <input id="models" list="providerList" value="opencode:opencode/deepseek-v4-flash-free,ollama:gpt-oss:120b-cloud">
-    <p class="hint">Pick from the dropdown (start typing to see it) or write your own
-      <code>provider:model</code>, comma-separated. Subscription, no API key — run this
-      app from a terminal/session where you're already signed in: <code>claude-cli</code>,
-      <code>claude-code</code>, <code>codex-cli</code>, <code>codex</code>. Free:
-      <code>opencode:&lt;model&gt;</code>, <code>ollama:&lt;model&gt;</code>. Needs an API key:
-      <code>deepseek</code>, <code>gemini</code>, <code>openrouter</code>, <code>anthropic</code>,
-      <code>openai</code>.</p>
-    <datalist id="providerList">
-      <option value="claude-cli">
-      <option value="claude-code">
-      <option value="codex-cli">
-      <option value="codex">
-      <option value="opencode:opencode/deepseek-v4-flash-free">
-      <option value="opencode:opencode/grok-code-free">
-      <option value="ollama:gpt-oss:120b-cloud">
-      <option value="ollama:llama3">
-      <option value="deepseek:deepseek-chat">
-      <option value="gemini:gemini-2.0-flash">
-      <option value="openrouter:deepseek/deepseek-chat-v3-0324:free">
-      <option value="anthropic:claude-opus-4-8">
-      <option value="openai:gpt-4o-mini">
-    </datalist>
+    <label>Models (agents, comma-separated — click to toggle)</label>
+    <input id="models" value="opencode:opencode/deepseek-v4-flash-free,ollama:gpt-oss:120b-cloud">
+    <div class="chips" id="modelChips"></div>
+    <p class="hint">Subscription, no API key — run this app from a terminal/session where
+      you're already signed in: <code>claude-cli</code> / <code>claude-code</code> (Claude),
+      <code>codex-cli</code> / <code>codex</code> (Codex). Free: <code>opencode:&lt;model&gt;</code>,
+      <code>ollama:&lt;model&gt;</code>. Needs an API key: <code>deepseek</code>, <code>gemini</code>,
+      <code>openrouter</code>, <code>anthropic</code>, <code>openai</code>.</p>
     <label>Max attempts</label>
     <input id="max" type="number" value="3" min="1" max="8">
     <button id="go" type="submit">▶ Lancer</button>
@@ -368,6 +358,47 @@ _PAGE = r"""<!doctype html>
   }
   $("mRace").onclick=()=>setMode("race");
   $("mAuto").onclick=()=>setMode("auto");
+
+  // provider chips — always visible, no hidden dropdown to discover
+  const MODEL_CHIPS = [
+    ["claude-code","claude-code"], ["claude-cli","claude-cli"],
+    ["codex","codex"], ["codex-cli","codex-cli"],
+    ["opencode:opencode/deepseek-v4-flash-free","opencode (free)"],
+    ["ollama:gpt-oss:120b-cloud","ollama (free)"],
+    ["deepseek:deepseek-chat","deepseek"], ["gemini:gemini-2.0-flash","gemini"],
+  ];
+  const ORCH_CHIPS = [  // orchestrator must be a completion model, not an autonomous editor
+    ["claude-cli","claude-cli"], ["codex-cli","codex-cli"],
+    ["ollama:gpt-oss:120b-cloud","ollama (free)"],
+    ["deepseek:deepseek-chat","deepseek"], ["gemini:gemini-2.0-flash","gemini"],
+  ];
+  function syncChips(rowId, value, multi){
+    const parts = multi ? value.split(",").map(s=>s.trim()).filter(Boolean) : [value.trim()];
+    $(rowId).querySelectorAll(".chip").forEach(ch=>{
+      ch.classList.toggle("on", parts.includes(ch.getAttribute("data-v")));
+    });
+  }
+  function paintChips(rowId, list, inputId, multi){
+    $(rowId).innerHTML = list.map(([v,label])=>`<span class="chip" data-v="${esc(v)}">${esc(label)}</span>`).join("");
+    $(rowId).querySelectorAll(".chip").forEach(ch=>{
+      ch.onclick = () => {
+        const v = ch.getAttribute("data-v");
+        const inp = $(inputId);
+        if(multi){
+          let parts = inp.value.split(",").map(s=>s.trim()).filter(Boolean);
+          const i = parts.indexOf(v);
+          if(i>=0) parts.splice(i,1); else parts.push(v);
+          inp.value = parts.join(", ");
+        } else { inp.value = v; }
+        syncChips(rowId, inp.value, multi);
+      };
+    });
+    syncChips(rowId, $(inputId).value, multi);
+  }
+  paintChips("modelChips", MODEL_CHIPS, "models", true);
+  paintChips("orchChips", ORCH_CHIPS, "orchestrator", false);
+  $("models").addEventListener("input", ()=>syncChips("modelChips", $("models").value, true));
+  $("orchestrator").addEventListener("input", ()=>syncChips("orchChips", $("orchestrator").value, false));
 
   // folder browser
   $("browse").onclick = () => { $("fb").style.display="block"; loadDir($("repo").value||""); };

@@ -38,9 +38,13 @@ def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
+_KIND_ALIASES = {"claude": "claude-cli", "codex": "codex-cli"}
+
+
 def build_agent(role: str, kind: str, model_override: str = "") -> Agent:
     """Create an Agent for `role` using backend `kind` (optional model override)."""
     kind = kind.lower()
+    kind = _KIND_ALIASES.get(kind, kind)  # bare "claude"/"codex" -> the completion CLI
 
     if kind == "mock":
         raise SystemExit("The 'mock' backend is only available via `maestro demo`.")
