@@ -9,12 +9,11 @@ from __future__ import annotations
 import difflib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Sequence
 
+from .focus import CODE_EXT as _TEXT_EXT
 from .protocol import Edit
-
-_SKIP_DIRS = {".git", "__pycache__", ".maestro", ".venv", "venv", "node_modules"}
-_TEXT_EXT = {".py", ".txt", ".md", ".json", ".toml", ".cfg", ".ini", ".js", ".ts"}
+from .store import IGNORE_DIRS as _SKIP_DIRS
 
 
 @dataclass
@@ -57,16 +56,24 @@ class Workspace:
     def read(self, rel: str) -> str:
         return self._resolve(rel).read_text(encoding="utf-8")
 
-    def context(self, max_chars_per_file: int = 4000, limit: int = 12) -> str:
+    def context(self, max_chars_per_file: int = 4000, limit: int = 12,
+                only: Optional[Sequence[str]] = None) -> str:
         """Full contents of text files — the Executor needs this; the
-        Supervisor never receives it."""
+        Supervisor never receives it.
+
+        `only` narrows the context to a specific set of files (see focus.py).
+        A failing check usually names the file that is actually broken, so
+        passing that here replaces a blind twelve-file dump with the one or two
+        files the agent really needs.
+        """
+        rels = list(only) if only else [
+            r for r in self.files(limit) if Path(r).suffix in _TEXT_EXT
+        ]
         chunks: List[str] = []
-        for rel in self.files(limit):
-            if Path(rel).suffix not in _TEXT_EXT:
-                continue
+        for rel in rels:
             try:
                 body = self.read(rel)
-            except (OSError, UnicodeDecodeError):
+            except (OSError, UnicodeDecodeError, ValueError):
                 continue
             if len(body) > max_chars_per_file:
                 body = body[:max_chars_per_file] + "\n... (truncated)"

@@ -44,6 +44,17 @@ def _load_dotenv(path: Path = Path(".env")) -> None:
         os.environ.setdefault(key.strip(), val.strip())
 
 
+def _journal(payload: dict) -> None:
+    """Record a run so `maestro runs` can show it later. Best-effort: a failure
+    to write history must never fail the work that succeeded."""
+    try:
+        from .store import record_run
+
+        record_run(payload)
+    except Exception:
+        pass
+
+
 def _print_result(result, ledger: Ledger) -> int:
     print("\n" + ledger.summary())
     verdict = "SUCCESS" if result.success else "INCOMPLETE"
@@ -426,11 +437,13 @@ def cmd_race(args) -> int:
         raise SystemExit("--models must list at least one provider, e.g. claude-cli,ollama")
 
     print(BANNER)
-    print(f"RACE — {len(models)} model(s), same task, best-of-N\n")
+    label = "CASCADE — cheapest tier first" if args.mode == "cascade" else "RACE — all at once"
+    print(f"{label}, {len(models)} model(s), best-of-N\n")
 
     from .race import pick_winner, race
 
-    results = race(models, args.repo, task, args.check, args.max_attempts, logger=print)
+    results = race(models, args.repo, task, args.check, args.max_attempts,
+                   logger=print, mode=args.mode)
 
     print("\n+---------------------- RACE RESULTS ----------------------+")
     for r in sorted(results, key=lambda r: (not r.passed, r.cost, r.tokens)):
@@ -461,16 +474,34 @@ def cmd_delegate(args) -> int:
     res = delegate(
         models, args.repo, task, args.check, args.max_attempts,
         apply=not args.no_apply, logger=(None if args.json else print),
+        mode=args.mode, use_cache=not args.no_cache,
     )
+    _journal({**res, "mode": "delegate", "repo": args.repo, "task": task[:400],
+              "check": args.check, "models": models})
 
     if args.json:
         print(json.dumps(res))
         return 0 if res["ok"] else 1
 
+    if res.get("skipped") == "already-green":
+        print(f"\n✓ nothing to do — {res['detail']} (0 tokens, no model started)")
+        return 0
+    if res.get("skipped") == "invalid-check":
+        print(f"\n✗ {res['detail']}")
+        print("  Fix the --check command; every agent would have failed on it identically.")
+        return 1
     if res["ok"]:
         files = ", ".join(res["applied_files"]) or "(none)"
-        print(f"\n✓ delegated to {res['winner']} — check passed; applied {len(res['applied_files'])} file(s): {files}")
+        how = "replayed from cache (0 tokens)" if res.get("cached") else f"delegated to {res['winner']}"
+        print(f"\n✓ {how} — check passed; applied {len(res['applied_files'])} file(s): {files}")
+        if res.get("unused_tiers"):
+            print(f"  never spent: {', '.join(res['unused_tiers'])}")
+        if res.get("undo"):
+            print(f"  undo with: maestro undo --id {res['undo']}")
         return 0
+    if res.get("warning"):
+        print(f"\n✗ {res['warning']}")
+        return 1
     print("\n✗ no agent passed the check; nothing applied.")
     for r in res["results"]:
         print(f"  - {r['spec']}: {r['error'] or r['reason']}")
@@ -488,7 +519,9 @@ def cmd_auto(args) -> int:
     from .auto import auto_run
 
     res = auto_run(goal, args.repo, args.orchestrator, models, args.max_attempts,
-                   logger=(None if args.json else print))
+                   logger=(None if args.json else print), mode=args.mode,
+                   use_cache=not args.no_cache)
+    _journal({**res, "mode": "auto", "repo": args.repo})
 
     if args.json:
         print(json.dumps(res))
@@ -497,12 +530,103 @@ def cmd_auto(args) -> int:
     print("\n+----------------------- AUTO RESULTS ----------------------+")
     for s in res["steps"]:
         tag = "OK  " if s["ok"] else "FAIL"
+        if s.get("skipped") == "already-green":
+            tag = "FREE"
+        elif s.get("cached"):
+            tag = "CACHE"
         files = ("-> " + ", ".join(s["applied_files"])) if s["applied_files"] else ""
-        print(f"  {tag}  {s['title'][:38]:<38} {files[:30]}")
+        print(f"  {tag:<5} {s['title'][:37]:<37} {files[:30]}")
     print("+-----------------------------------------------------------+")
     passed = sum(1 for s in res["steps"] if s["ok"])
+    if res.get("free_steps"):
+        print(f"  {res['free_steps']} sub-task(s) cost 0 tokens (already green, or cached)")
     print(f"\nRESULT: {'SUCCESS' if res['ok'] else 'INCOMPLETE'} ({passed}/{len(res['steps'])} sub-tasks)")
     return 0 if res["ok"] else 1
+
+
+# --------------------------------------------------------------------------- #
+# doctor / undo / runs — know before you spend, and recover after
+# --------------------------------------------------------------------------- #
+def cmd_doctor(args) -> int:
+    _load_dotenv()
+    from .preflight import doctor
+    from .store import disk_usage
+
+    rows = doctor()
+    if args.json:
+        print(json.dumps({"backends": rows, "disk": disk_usage()}))
+        return 0
+
+    print(BANNER)
+    print("Backends on this machine — Maestro spends them top to bottom.\n")
+    tier_now = None
+    for r in rows:
+        if r["tier"] != tier_now:
+            tier_now = r["tier"]
+            print(f"  [{tier_now}]")
+        mark = "OK " if r["available"] else "-- "
+        print(f"    {mark} {r['kind']:<14} {r['label']}")
+        print(f"        {r['detail']}")
+        if r["available"]:
+            print(f"        use: --models {r['spec']}")
+        if r["warn"]:
+            print(f"        ! {r['warn']}")
+    ready = [r["spec"] for r in rows if r["available"]]
+    print(f"\n  ready now: {', '.join(ready) if ready else '(none)'}")
+
+    disk = disk_usage()
+    print(f"  scratch space: {disk['total'] / 1e6:.1f} MB under .maestro/")
+    return 0
+
+
+def cmd_undo(args) -> int:
+    from .store import list_snapshots, restore
+
+    if args.list:
+        snaps = list_snapshots()
+        if not snaps:
+            print("No snapshot recorded yet.")
+            return 0
+        for s in snaps:
+            who = (s.get("meta") or {}).get("winner") or (s.get("meta") or {}).get("source") or "?"
+            print(f"  {s['id']}  {s['created']}  {s['files']:>3} file(s)  [{who}]  {s['repo']}")
+        return 0
+
+    res = restore(args.id)
+    if not res["ok"] and res.get("error"):
+        print(f"✗ {res['error']}")
+        return 1
+    print(f"✓ rolled back {res['id']} in {res['repo']}")
+    for f in res["restored"]:
+        print(f"    restored  {f}")
+    for f in res["removed"]:
+        print(f"    removed   {f}")
+    for f in res["failed"]:
+        print(f"    FAILED    {f}")
+    return 0 if res["ok"] else 1
+
+
+def cmd_runs(args) -> int:
+    from .store import get_run, list_runs
+
+    if args.id:
+        run = get_run(args.id)
+        if not run:
+            print(f"No run recorded with id {args.id}")
+            return 1
+        print(json.dumps(run, indent=2, default=str))
+        return 0
+
+    runs = list_runs()
+    if not runs:
+        print("No run recorded yet.")
+        return 0
+    for r in runs:
+        verdict = "ok" if r.get("ok") else "--"
+        what = (r.get("goal") or r.get("task") or "")[:44]
+        print(f"  {r['id']}  {r['saved_at']}  {r['mode']:<6} {verdict:<3} {what}")
+    print("\n  detail: maestro runs --id <ID>")
+    return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -535,7 +659,9 @@ def main(argv=None) -> int:
     p_demo = sub.add_parser("demo", help="run the offline, zero-config demo")
     p_demo.add_argument("--pro", action="store_true", help="use the larger, more realistic demo project")
 
-    providers = ["claude-cli", "codex-cli", "ollama", "deepseek", "gemini", "openrouter", "anthropic", "openai"]
+    from . import registry
+
+    providers = registry.known_kinds()
 
     p_run = sub.add_parser("run", help="run on a real task with real backends")
     p_run.add_argument("--task", required=True, help="task description, or path to a .md/.txt file")
@@ -551,6 +677,8 @@ def main(argv=None) -> int:
     p_race.add_argument("--check", required=True, help="shell command that exits 0 when the task is done")
     p_race.add_argument("--models", required=True, help="comma-separated providers, e.g. claude-cli,ollama,codex-cli")
     p_race.add_argument("--max-attempts", type=int, default=3)
+    p_race.add_argument("--mode", choices=["race", "cascade"], default="race",
+                        help="race = all at once; cascade = cheapest tier first, escalate only on failure")
 
     p_del = sub.add_parser("delegate", help="offload a task to free agents in parallel and apply the winner (for orchestrators)")
     p_del.add_argument("--task", required=True, help="task description, or path to a file")
@@ -561,6 +689,10 @@ def main(argv=None) -> int:
     p_del.add_argument("--max-attempts", type=int, default=2)
     p_del.add_argument("--no-apply", action="store_true", help="don't write changes back to the repo")
     p_del.add_argument("--json", action="store_true", help="compact JSON output (for agents)")
+    p_del.add_argument("--mode", choices=["race", "cascade"], default="race",
+                       help="cascade spends free models first and only escalates if they fail")
+    p_del.add_argument("--no-cache", action="store_true",
+                       help="don't replay a previously winning answer for the same task+code")
 
     p_auto = sub.add_parser("auto", help="decompose a goal into sub-tasks and delegate each to free agents")
     p_auto.add_argument("--goal", required=True, help="high-level objective, or path to a file")
@@ -571,11 +703,23 @@ def main(argv=None) -> int:
                         help="free agents that execute each sub-task")
     p_auto.add_argument("--max-attempts", type=int, default=2)
     p_auto.add_argument("--json", action="store_true")
+    p_auto.add_argument("--mode", choices=["race", "cascade"], default="race")
+    p_auto.add_argument("--no-cache", action="store_true")
 
     p_serve = sub.add_parser("serve", help="launch the web control room (dashboard)")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8765)
     p_serve.add_argument("--no-browser", action="store_true", help="don't auto-open a browser")
+
+    p_doc = sub.add_parser("doctor", help="report which backends actually work on this machine")
+    p_doc.add_argument("--json", action="store_true")
+
+    p_undo = sub.add_parser("undo", help="roll back the last change Maestro applied to a repo")
+    p_undo.add_argument("--list", action="store_true", help="show recorded snapshots")
+    p_undo.add_argument("--id", default=None, help="snapshot to restore (default: the most recent)")
+
+    p_runs = sub.add_parser("runs", help="list past runs (they outlive the dashboard)")
+    p_runs.add_argument("--id", default=None, help="print one run in full")
 
     args = parser.parse_args(argv)
     if args.cmd == "demo":
@@ -590,6 +734,12 @@ def main(argv=None) -> int:
         return cmd_auto(args)
     if args.cmd == "serve":
         return cmd_serve(args)
+    if args.cmd == "doctor":
+        return cmd_doctor(args)
+    if args.cmd == "undo":
+        return cmd_undo(args)
+    if args.cmd == "runs":
+        return cmd_runs(args)
     parser.print_help()
     return 2
 

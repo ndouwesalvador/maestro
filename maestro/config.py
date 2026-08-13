@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 
+from . import registry
 from .agents.base import Agent
 from .ledger import Price
 
@@ -38,13 +39,17 @@ def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
-_KIND_ALIASES = {"claude": "claude-cli", "codex": "codex-cli"}
+_KIND_ALIASES = dict(registry.ALIASES)  # kept for callers that introspect it
 
 
 def build_agent(role: str, kind: str, model_override: str = "") -> Agent:
-    """Create an Agent for `role` using backend `kind` (optional model override)."""
-    kind = kind.lower()
-    kind = _KIND_ALIASES.get(kind, kind)  # bare "claude"/"codex" -> the completion CLI
+    """Create a completion Agent for `role` using backend `kind`.
+
+    Names are resolved through the registry, so bare "claude"/"codex" work, and
+    an autonomous kind asked for in a completion role (picking "claude-code" as
+    the orchestrator, say) is served by its completion twin instead of failing.
+    """
+    kind = registry.completion_kind(kind)
 
     if kind == "mock":
         raise SystemExit("The 'mock' backend is only available via `maestro demo`.")
@@ -112,24 +117,23 @@ def build_agent(role: str, kind: str, model_override: str = "") -> Agent:
         return CodexCliAgent(model=model_override or _env("MAESTRO_CODEX_MODEL", ""), role=role)
 
     raise SystemExit(
-        f"Unknown backend '{kind}'. Use: claude-cli | codex-cli | ollama | "
-        "deepseek | gemini | openrouter | anthropic | openai."
+        f"Unknown backend '{kind}'. Use one of: {' | '.join(registry.known_kinds())}."
     )
 
 
 def price_for(kind: str) -> Price:
     """Per-token price for a provider (illustrative; see PROVIDER_PRICES)."""
-    return PROVIDER_PRICES.get(kind.lower(), LOCAL_PRICE)
+    return PROVIDER_PRICES.get(registry.resolve(kind), LOCAL_PRICE)
 
 
 # Providers that EDIT files themselves (full agent CLIs), vs completion backends
 # that return text Maestro applies.
-AUTONOMOUS_KINDS = {"claude-code", "codex", "opencode"}
+AUTONOMOUS_KINDS = registry.autonomous_kinds()
 
 
 def build_autonomous_agent(kind: str, model_override: str = ""):
     """Create an autonomous coding-agent backend (edits files in a directory)."""
-    kind = kind.lower()
+    kind = registry.resolve(kind)
     if kind == "claude-code":
         from .agents.autonomous import ClaudeCodeAgent
 

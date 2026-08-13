@@ -19,7 +19,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .race import pick_winner, race
+from . import store
+from .race import delegate
 
 _RUNS: dict = {}
 _STOPS: dict = {}
@@ -65,19 +66,39 @@ def _run_race(rid: str, payload: dict, models: list) -> None:
             "reason": r.reason or ("passed" if r.passed else "failed"),
             "passed": r.passed, "attempts": r.attempts, "tokens": r.tokens,
             "cost": round(r.cost, 5), "note": (r.error or r.summary or "")[:160],
-            "workdir": r.workdir,
+            "workdir": r.workdir, "tier": r.tier,
         }
 
     try:
-        results = race(models, payload["repo"], payload["task"], payload["check"],
-                       int(payload.get("max_attempts", 3) or 3),
-                       on_result=on_result, cancel=cancel, on_event=on_event)
-        winner = pick_winner(results)
-        state["winner"] = winner.spec if winner else None
+        # Manuel mode goes through delegate() so it gets the baseline check, the
+        # cache, the safe apply and the undo snapshot — same engine as the CLI.
+        res = delegate(
+            models, payload["repo"], payload["task"], payload["check"],
+            int(payload.get("max_attempts", 3) or 3),
+            apply=bool(payload.get("apply", True)),
+            mode=payload.get("strategy") or "race",
+            use_cache=bool(payload.get("cache", True)),
+            on_result=on_result, cancel=cancel, on_event=on_event,
+        )
+        state.update({
+            "winner": res["winner"], "applied_files": res["applied_files"],
+            "undo": res.get("undo"), "skipped": res.get("skipped"),
+            "detail": res.get("detail", ""), "cached": res.get("cached", False),
+            "warning": res.get("warning", ""), "unused_tiers": res.get("unused_tiers", []),
+            "tokens": res.get("tokens", 0), "ok": res["ok"],
+        })
+        # Baseline/cache can end the job before any racer starts; without this
+        # their cards would spin on "running" forever next to a finished banner.
+        if res.get("skipped") or res.get("cached"):
+            for racer in state["racers"].values():
+                if racer.get("status") != "done":
+                    racer.update({"status": "done", "reason": "skipped",
+                                  "note": res.get("detail", "")})
     except (Exception, SystemExit) as exc:
         state["error"] = str(exc)[:300]
     finally:
         state["done"] = True
+        store.record_run(state)
 
 
 def _run_auto(rid: str, payload: dict, models: list) -> None:
@@ -102,12 +123,17 @@ def _run_auto(rid: str, payload: dict, models: list) -> None:
             payload.get("orchestrator") or "ollama:gpt-oss:120b-cloud",
             models, int(payload.get("max_attempts", 2) or 2),
             on_plan=on_plan, on_step=on_step,
+            mode=payload.get("strategy") or "race",
+            use_cache=bool(payload.get("cache", True)),
         )
         state["ok"] = res["ok"]
+        state["tokens"] = res.get("tokens", 0)
+        state["free_steps"] = res.get("free_steps", 0)
     except (Exception, SystemExit) as exc:
         state["error"] = str(exc)[:300]
     finally:
         state["done"] = True
+        store.record_run(state)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -126,12 +152,32 @@ class _Handler(BaseHTTPRequestHandler):
         route = urlparse(self.path)
         q = parse_qs(route.query)
         if route.path == "/":
-            self._send(200, _PAGE, "text/html; charset=utf-8")
+            # The catalogue is static metadata, so the model list can be drawn
+            # immediately; /api/doctor then annotates it with what is actually
+            # installed. Waiting on a probe to show the list at all is how a
+            # user ends up believing a provider isn't offered.
+            from . import registry
+
+            catalog = json.dumps([
+                {"kind": b.kind, "label": b.label, "tier": b.tier, "spec": b.spec,
+                 "can_plan": b.can_plan, "available": None, "detail": "vérification…",
+                 "warn": ""}
+                for b in registry.BACKENDS.values()
+            ])
+            self._send(200, _PAGE.replace("/*CATALOG*/[]", catalog),
+                       "text/html; charset=utf-8")
         elif route.path == "/api/ls":
             self._send(200, json.dumps(_list_dir((q.get("path") or [""])[0])))
         elif route.path == "/api/status":
             rid = (q.get("id") or [""])[0]
-            self._send(200, json.dumps(_RUNS.get(rid, {"error": "unknown id"})))
+            self._send(200, json.dumps(_RUNS.get(rid) or store.get_run(rid)
+                                       or {"error": "unknown id"}))
+        elif route.path == "/api/doctor":
+            from .preflight import doctor
+
+            self._send(200, json.dumps({"backends": doctor(), "disk": store.disk_usage()}))
+        elif route.path == "/api/runs":
+            self._send(200, json.dumps({"runs": store.list_runs(30)}))
         else:
             self._send(404, json.dumps({"error": "not found"}))
 
@@ -148,6 +194,11 @@ class _Handler(BaseHTTPRequestHandler):
                 if spec in stops:
                     stops[spec].set()
             self._send(200, json.dumps({"ok": True, "stopped": targets}))
+            return
+
+        if route.path == "/api/undo":
+            sid = (q.get("sid") or [""])[0]
+            self._send(200, json.dumps(store.restore(sid or None)))
             return
 
         length = int(self.headers.get("Content-Length", 0) or 0)
@@ -168,7 +219,10 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             rid = uuid.uuid4().hex[:8]
             _STOPS[rid] = {m: threading.Event() for m in models}
-            _RUNS[rid] = {"id": rid, "mode": "race", "done": False, "winner": None, "models": models,
+            _RUNS[rid] = {"id": rid, "mode": "race", "done": False, "winner": None,
+                          "models": models, "task": payload.get("task", ""),
+                          "strategy": payload.get("strategy") or "race",
+                          "applied_files": [], "undo": None,
                           "racers": {m: {"spec": m, "model": m, "status": "running", "reason": "",
                                          "attempts": 0, "tokens": 0, "cost": 0.0, "note": ""} for m in models}}
             threading.Thread(target=_run_race, args=(rid, payload, models), daemon=True).start()
@@ -184,7 +238,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             rid = uuid.uuid4().hex[:8]
             _RUNS[rid] = {"id": rid, "mode": "auto", "done": False, "ok": False,
-                          "goal": payload["goal"], "steps": []}
+                          "goal": payload["goal"], "steps": [],
+                          "strategy": payload.get("strategy") or "race"}
             threading.Thread(target=_run_auto, args=(rid, payload, models), daemon=True).start()
             self._send(200, json.dumps({"id": rid}))
             return
@@ -269,6 +324,22 @@ _PAGE = r"""<!doctype html>
         padding:4px 10px;font-size:11px;cursor:pointer;user-select:none}
   .chip:hover{border-color:var(--accent)}
   .chip.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .chip.off{opacity:.45}
+  .chip .tick{font-size:10px;margin-right:4px}
+  .tierhead{width:100%;margin:8px 0 2px;color:var(--mut);font-size:10px;
+            text-transform:uppercase;letter-spacing:.7px}
+  .tierhead b{color:var(--txt);font-weight:600}
+  .check{display:flex;align-items:center;gap:7px;margin-top:10px;color:var(--mut);font-size:12px}
+  .check input{width:auto}
+  .undo{background:#3d2a14;color:#ffcf8f;border:1px solid #6b4a1d;font-size:12px;
+        padding:6px 11px;margin-top:10px}
+  .savebar{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent);
+           border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:12px;color:var(--mut)}
+  .savebar b{color:var(--txt)}
+  .free{background:linear-gradient(90deg,#13251c,#161b22);border:1px solid var(--pass)}
+  .b-queued{background:rgba(110,118,129,.18);color:var(--mut)}
+  .b-skip{background:rgba(46,160,67,.10);color:var(--mut)}
+  .b-cache{background:rgba(124,92,255,.18);color:#b9a6ff}
   .stopbtn{margin-top:10px;background:#3d1418;color:#ff9a90;border:1px solid #5b1a1f;font-size:12px;padding:5px 10px}
   .empty{color:var(--mut)}
   #fb{display:none;border:1px solid var(--line);border-radius:8px;margin-top:6px;background:#0b0f14}
@@ -325,16 +396,23 @@ _PAGE = r"""<!doctype html>
       <div class="chips" id="orchChips"></div>
     </div>
 
-    <label>Models (agents, comma-separated — click to toggle)</label>
+    <label>Stratégie</label>
+    <div class="modes">
+      <button type="button" id="sRace" class="modebtn active">Race (tous en même temps)</button>
+      <button type="button" id="sCasc" class="modebtn">Cascade (gratuit d'abord)</button>
+    </div>
+    <p class="hint" id="stratHint">Race : le plus rapide, mais chaque modèle est dépensé.</p>
+
+    <label>Models (agents — cliquez pour ajouter/retirer)</label>
     <input id="models" value="opencode:opencode/deepseek-v4-flash-free,ollama:gpt-oss:120b-cloud">
-    <div class="chips" id="modelChips"></div>
-    <p class="hint">Subscription, no API key — run this app from a terminal/session where
-      you're already signed in: <code>claude-cli</code> / <code>claude-code</code> (Claude),
-      <code>codex-cli</code> / <code>codex</code> (Codex). Free: <code>opencode:&lt;model&gt;</code>,
-      <code>ollama:&lt;model&gt;</code>. Needs an API key: <code>deepseek</code>, <code>gemini</code>,
-      <code>openrouter</code>, <code>anthropic</code>, <code>openai</code>.</p>
+    <div class="chips" id="modelChips"><span class="hint">détection en cours…</span></div>
+
     <label>Max attempts</label>
     <input id="max" type="number" value="3" min="1" max="8">
+    <label class="check"><input type="checkbox" id="apply" checked>
+      Appliquer le gagnant dans mon dossier (annulable)</label>
+    <label class="check"><input type="checkbox" id="cache" checked>
+      Réutiliser une réponse déjà validée (0 token)</label>
     <button id="go" type="submit">▶ Lancer</button>
   </form>
 
@@ -359,19 +437,23 @@ _PAGE = r"""<!doctype html>
   $("mRace").onclick=()=>setMode("race");
   $("mAuto").onclick=()=>setMode("auto");
 
-  // provider chips — always visible, no hidden dropdown to discover
-  const MODEL_CHIPS = [
-    ["claude-code","claude-code"], ["claude-cli","claude-cli"],
-    ["codex","codex"], ["codex-cli","codex-cli"],
-    ["opencode:opencode/deepseek-v4-flash-free","opencode (free)"],
-    ["ollama:gpt-oss:120b-cloud","ollama (free)"],
-    ["deepseek:deepseek-chat","deepseek"], ["gemini:gemini-2.0-flash","gemini"],
-  ];
-  const ORCH_CHIPS = [  // orchestrator must be a completion model, not an autonomous editor
-    ["claude-cli","claude-cli"], ["codex-cli","codex-cli"],
-    ["ollama:gpt-oss:120b-cloud","ollama (free)"],
-    ["deepseek:deepseek-chat","deepseek"], ["gemini:gemini-2.0-flash","gemini"],
-  ];
+  // Strategy: race everyone at once, or climb the price ladder.
+  let strategy="race";
+  function setStrategy(s){
+    strategy=s;
+    $("sRace").classList.toggle("active", s==="race");
+    $("sCasc").classList.toggle("active", s==="cascade");
+    $("stratHint").textContent = s==="race"
+      ? "Race : le plus rapide, mais chaque modèle listé est dépensé."
+      : "Cascade : les modèles gratuits d'abord. Votre abonnement Claude/Codex n'est utilisé que si le gratuit échoue.";
+  }
+  $("sRace").onclick=()=>setStrategy("race");
+  $("sCasc").onclick=()=>setStrategy("cascade");
+
+  // Provider chips are built from /api/doctor, so the list shows what is
+  // actually installed here — with a reason attached to anything that isn't.
+  const TIERS=[["free","Gratuit"],["subscription","Abonnement — sans clé API"],["api-key","Clé API requise"]];
+  let DOCTOR=/*CATALOG*/[];
   function syncChips(rowId, value, multi){
     const parts = multi ? value.split(",").map(s=>s.trim()).filter(Boolean) : [value.trim()];
     $(rowId).querySelectorAll(".chip").forEach(ch=>{
@@ -379,11 +461,23 @@ _PAGE = r"""<!doctype html>
     });
   }
   function paintChips(rowId, list, inputId, multi){
-    $(rowId).innerHTML = list.map(([v,label])=>`<span class="chip" data-v="${esc(v)}">${esc(label)}</span>`).join("");
+    let html="";
+    TIERS.forEach(([tier,label])=>{
+      const items=list.filter(b=>b.tier===tier);
+      if(!items.length) return;
+      html += `<div class="tierhead"><b>${esc(label)}</b></div>`;
+      html += items.map(b=>{
+        const why = b.detail + (b.warn ? "  ⚠ " + b.warn : "");
+        // null = not probed yet; the chip is listed but not yet judged.
+        const tick = b.available===true ? "✓" : (b.available===false ? "✗" : "·");
+        return `<span class="chip${b.available===false?" off":""}" data-v="${esc(b.spec)}" title="${esc(why)}">`+
+               `<span class="tick">${tick}</span>${esc(b.label)}</span>`;
+      }).join("");
+    });
+    $(rowId).innerHTML = html || '<span class="hint">aucun backend détecté</span>';
     $(rowId).querySelectorAll(".chip").forEach(ch=>{
       ch.onclick = () => {
-        const v = ch.getAttribute("data-v");
-        const inp = $(inputId);
+        const v = ch.getAttribute("data-v"), inp = $(inputId);
         if(multi){
           let parts = inp.value.split(",").map(s=>s.trim()).filter(Boolean);
           const i = parts.indexOf(v);
@@ -395,8 +489,24 @@ _PAGE = r"""<!doctype html>
     });
     syncChips(rowId, $(inputId).value, multi);
   }
-  paintChips("modelChips", MODEL_CHIPS, "models", true);
-  paintChips("orchChips", ORCH_CHIPS, "orchestrator", false);
+  function paintAll(){
+    paintChips("modelChips", DOCTOR, "models", true);
+    paintChips("orchChips", DOCTOR.filter(b=>b.can_plan), "orchestrator", false);
+  }
+  paintAll();  // instantly, from the catalogue baked into the page
+  async function loadDoctor(){
+    try { DOCTOR = (await (await fetch("/api/doctor")).json()).backends || DOCTOR; }
+    catch(e){ return; }
+    paintAll();
+    const down = DOCTOR.filter(b=>b.available===false && ($("models").value||"").includes(b.kind));
+    if(down.length){
+      $("grid").innerHTML = down.map(b=>
+        `<div class="card"><div class="top"><span class="name">${esc(b.label)}</span>
+         <span class="badge b-err"><span class="dot"></span>indisponible</span></div>
+         <div class="note">${esc(b.detail)}</div></div>`).join("");
+    }
+  }
+  loadDoctor();
   $("models").addEventListener("input", ()=>syncChips("modelChips", $("models").value, true));
   $("orchestrator").addEventListener("input", ()=>syncChips("orchChips", $("orchestrator").value, false));
 
@@ -423,7 +533,9 @@ _PAGE = r"""<!doctype html>
     e.preventDefault();
     if(!$("repo").value){ alert("Pick a working folder first."); return; }
     $("go").disabled=true; $("winner").style.display="none";
-    let url, body={ repo:$("repo").value, models:$("models").value, max_attempts:parseInt($("max").value||"3") };
+    let url, body={ repo:$("repo").value, models:$("models").value,
+                    max_attempts:parseInt($("max").value||"3"),
+                    strategy:strategy, apply:$("apply").checked, cache:$("cache").checked };
     if(mode==="race"){ url="/api/race"; body.task=$("task").value; body.check=$("check").value; }
     else { url="/api/auto"; body.goal=$("goal").value; body.orchestrator=$("orchestrator").value; }
     const j = await (await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})).json();
@@ -440,9 +552,11 @@ _PAGE = r"""<!doctype html>
   }
 
   function raceBadge(c){
+    if(c.status==="queued") return ["b-queued","en attente"];
     if(c.status!=="done") return ["b-running","running · try "+(c.attempts||0)];
     const r=c.reason||(c.passed?"passed":"failed");
     if(r==="passed") return ["b-pass","PASS"];
+    if(r==="skipped") return ["b-skip","non dépensé"];
     if(r==="stopped") return ["b-stop","stopped"];
     if(r==="error") return ["b-err","error"];
     if(["runaway","stalled","timeout"].includes(r)) return ["b-warn","⚠ "+r];
@@ -452,13 +566,25 @@ _PAGE = r"""<!doctype html>
     return {pending:["b-pending","pending"],running:["b-running","running"],
             done:["b-pass","done"],failed:["b-fail","failed"]}[st]||["b-pending",st];
   }
+  function undoBtn(sid){
+    return sid ? `<button class="undo" id="undoBtn" data-sid="${esc(sid)}">↺ Annuler ces modifications</button>` : "";
+  }
+  function wireUndo(){
+    const b=$("undoBtn"); if(!b) return;
+    b.onclick=async()=>{ b.disabled=true; b.textContent="annulation…";
+      const r=await (await fetch("/api/undo?sid="+encodeURIComponent(b.getAttribute("data-sid")),{method:"POST"})).json();
+      b.textContent = r.ok ? ("↺ annulé — "+r.restored.length+" fichier(s) restauré(s)") : ("⚠ "+(r.error||"échec"));
+    };
+  }
 
   function render(s){
     const w=$("winner");
     if(s.steps!==undefined){ // AUTO
       const steps=s.steps||[];
       $("grid").innerHTML = steps.length ? steps.map((st,i)=>{
-        const [cls,label]=stepBadge(st.status);
+        let [cls,label]=stepBadge(st.status);
+        if(st.skipped==="already-green"){ cls="b-skip"; label="déjà verte · 0 token"; }
+        else if(st.cached){ cls="b-cache"; label="cache · 0 token"; }
         const files = (st.applied_files&&st.applied_files.length)?("applied: "+st.applied_files.join(", ")):"";
         const breakdown = (st.results||[]).map(r=>
           esc(r.spec||r.model)+" → "+esc(r.reason||(r.passed?"passed":"failed"))+
@@ -472,9 +598,10 @@ _PAGE = r"""<!doctype html>
           ${breakdown?`<div class="note">${breakdown}</div>`:""}</div>`;
       }).join("") : (s.done ? '<p class="empty">No checkable sub-task was planned — try a more specific goal, or pick a different orchestrator.</p>' : '<p class="empty">planning…</p>');
       if(s.done){ w.style.display="block";
+        const free = s.free_steps ? ` — ${s.free_steps} sous-tâche(s) à 0 token (déjà verte, ou en cache)` : "";
         w.innerHTML = s.error ? ("⚠ "+esc(s.error))
-          : (s.ok ? "🏆 <b>SUCCESS</b> — toutes les sous-tâches sont passées et appliquées."
-                  : "Terminé — certaines sous-tâches n'ont pas passé (rien d'appliqué pour celles-là)."); }
+          : (s.ok ? "🏆 <b>SUCCESS</b> — toutes les sous-tâches sont passées et appliquées."+esc(free)
+                  : "Terminé — certaines sous-tâches n'ont pas passé (rien d'appliqué pour celles-là)."+esc(free)); }
       return;
     }
     // RACE
@@ -492,10 +619,27 @@ _PAGE = r"""<!doctype html>
       b.onclick=()=>{ b.textContent="stopping…"; b.disabled=true;
         fetch("/api/stop?id="+runId+"&model="+encodeURIComponent(b.getAttribute("data-s")),{method:"POST"}); };
     });
-    if(s.done && s.winner && s.racers[s.winner]){ const win=s.racers[s.winner];
-      w.style.display="block"; w.innerHTML=`🏆 <b>WINNER:</b> ${esc(win.model)} — $${(win.cost||0).toFixed(4)}`;
-    } else if(s.done && s.error){ w.style.display="block"; w.textContent="⚠ "+s.error; }
-    else if(s.done){ w.style.display="block"; w.textContent="No model passed the check."; }
+    if(!s.done) return;
+    w.style.display="block"; w.classList.remove("free");
+    const files=(s.applied_files&&s.applied_files.length)
+      ? `<div class="note">appliqué : ${esc(s.applied_files.join(", "))}</div>` : "";
+    const unused=(s.unused_tiers&&s.unused_tiers.length)
+      ? `<div class="note">jamais dépensé : ${esc(s.unused_tiers.join(", "))}</div>` : "";
+
+    if(s.error){ w.innerHTML="⚠ "+esc(s.error); }
+    else if(s.skipped==="already-green"){ w.classList.add("free");
+      w.innerHTML="✅ <b>Rien à faire</b> — le check passait déjà. Aucun modèle lancé, 0 token."; }
+    else if(s.skipped==="invalid-check"){
+      w.innerHTML="⚠ <b>Check invalide</b> — "+esc(s.detail||"")+
+        '<div class="note">Corrigez la commande : tous les agents auraient échoué dessus de la même façon.</div>'; }
+    else if(s.cached){ w.classList.add("free");
+      w.innerHTML="⚡ <b>Rejoué depuis le cache</b> — 0 token, aucun modèle lancé."+files+undoBtn(s.undo); }
+    else if(s.warning){ w.innerHTML="⚠ "+esc(s.warning); }
+    else if(s.winner && s.racers[s.winner]){ const win=s.racers[s.winner];
+      w.innerHTML=`🏆 <b>WINNER:</b> ${esc(win.model)} — $${(win.cost||0).toFixed(4)}`+
+        ` · ${s.tokens||0} tokens`+files+unused+undoBtn(s.undo); }
+    else { w.innerHTML="Aucun modèle n'a passé le check."+unused; }
+    wireUndo();
   }
 </script>
 </body>

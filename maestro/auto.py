@@ -54,12 +54,15 @@ def auto_run(
     on_plan: Optional[Callable[[List[dict]], None]] = None,
     on_step: Optional[Callable[[int, dict], None]] = None,
     logger: Optional[Callable[[str], None]] = None,
+    mode: str = "race",
+    use_cache: bool = True,
 ) -> dict:
     log = logger or (lambda _m: None)
     repo_path = Path(repo).resolve()
 
-    # 1) Decompose the goal (the orchestrator is a completion model: claude-cli,
-    #    codex-cli, ollama, deepseek, ...).
+    # 1) Decompose the goal. The orchestrator must be a completion model;
+    #    picking an autonomous agent here resolves to its completion twin
+    #    (claude-code -> claude-cli) rather than failing.
     okind, omodel = _parse_spec(orchestrator_spec)
     orchestrator = build_agent("supervisor", okind, omodel)
     tree = Workspace(repo_path).tree(120)
@@ -69,24 +72,31 @@ def auto_run(
         on_plan(steps)
     log(f"[auto] {len(steps)} sub-task(s) planned")
 
-    # 2) Delegate each sub-task to the free agents (best-of-N, apply on pass).
+    # 2) Delegate each sub-task. delegate() runs its own baseline first, so a
+    #    step the plan invented but that is already satisfied costs nothing.
     results = []
     for i, s in enumerate(steps):
         if on_step:
             on_step(i, {"status": "running"})
         log(f"[auto] step {i + 1}/{len(steps)}: {s['title']}")
         res = delegate(executor_specs, str(repo_path), s["task"], s["check"],
-                       max_attempts, apply=True, logger=logger)
-        row = {**s, "ok": res["ok"], "winner": res["winner"], "applied_files": res["applied_files"],
-               "results": res["results"]}
-        results.append(row)
+                       max_attempts, apply=True, logger=logger, mode=mode,
+                       use_cache=use_cache)
+        info = {
+            "status": "done" if res["ok"] else "failed",
+            "winner": res["winner"], "applied_files": res["applied_files"],
+            "results": res["results"], "skipped": res.get("skipped"),
+            "cached": res.get("cached", False), "detail": res.get("detail", ""),
+            "tokens": res.get("tokens", 0), "undo": res.get("undo"),
+        }
+        results.append({**s, "ok": res["ok"], **info})
         if on_step:
-            on_step(i, {"status": "done" if res["ok"] else "failed",
-                        "winner": res["winner"], "applied_files": res["applied_files"],
-                        "results": res["results"]})
+            on_step(i, info)
 
     return {
         "goal": goal,
         "ok": bool(results) and all(r["ok"] for r in results),
         "steps": results,
+        "tokens": sum(r.get("tokens", 0) for r in results),
+        "free_steps": sum(1 for r in results if r.get("skipped") or r.get("cached")),
     }

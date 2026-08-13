@@ -51,6 +51,16 @@ the tokens spent on each side.
 
 ## Real usage
 
+Start by asking what actually works on your machine:
+
+```bash
+maestro doctor
+```
+
+It lists every backend by tier, marks what's usable, and tells you why anything
+isn't (`ollama serve` not running, CLI not installed, API key unset) — plus the
+exact `--models` string to copy.
+
 ```bash
 # Option A — use your SUBSCRIPTIONS, no API key (recommended):
 #   just have `claude` and/or `codex` installed and logged in.
@@ -243,7 +253,7 @@ less compute". The exact figure depends on the task:
 
 Set your real provider prices in [`maestro/config.py`](maestro/config.py).
 
-## The three ideas that make it efficient
+## The ideas that make it efficient
 
 Most multi-agent setups *increase* cost because the agents chatter. Maestro
 avoids that with:
@@ -257,16 +267,59 @@ avoids that with:
    the objective check passes; the Supervisor is only invoked to plan and to
    correct failures.
 
+…and four more that cost nothing to run:
+
+4. **Baseline first** — the check is run once against the real repo *before* any
+   model starts. Already green? The job ends at zero tokens. Check invalid
+   (missing command, wrong script name)? You're told immediately, instead of
+   discovering it after N agents have failed on it identically.
+5. **Focused context** — a failing check names the file that's broken. Maestro
+   reads those names and sends the agent *those* files, rather than the first
+   twelve in the directory. On a real repo that's a ~12k-token prompt down to
+   ~1k, per attempt, per racer.
+6. **Cascade** — `--mode cascade` climbs the price ladder: free models first,
+   your Claude/Codex subscription only if they fail. It reports which tiers it
+   never had to touch.
+7. **A cache with a safety net** — the same task on the same code replays its
+   known-good patch for free, then *re-runs the check*; a stale entry is rolled
+   back and discarded rather than trusted.
+
+```console
+$ maestro delegate --task "fix factorial" --check "python -m pytest -q" ...
+✓ delegated to opencode:...  — check passed; applied 1 file(s)     ~90s, real tokens
+
+$ maestro undo && maestro delegate ...   # same job, same code
+[cache] replayed a known-good answer (1 file(s)) — 0 tokens         1.8s, 0 tokens
+
+$ maestro delegate ...                   # now that the code is fixed
+[baseline] the check already passes — no model started              0.9s, 0 tokens
+```
+
 ## Project layout
 
 | File | Role |
 |------|------|
+| [`registry.py`](maestro/registry.py)       | Every backend, its tier and its label — one source of truth |
+| [`preflight.py`](maestro/preflight.py)     | `doctor` (what works here) + `baseline` (is this job worth running?) |
+| [`focus.py`](maestro/focus.py)             | Picks the files a failing check actually named |
+| [`store.py`](maestro/store.py)             | Ignore rules, run journal, undo snapshots, delegation cache |
+| [`race.py`](maestro/race.py)               | Best-of-N race / cascade, and the `delegate` entry point |
 | [`protocol.py`](maestro/protocol.py)       | Typed agent-to-agent messages + parsers |
-| [`agents/`](maestro/agents)                | Pluggable backends (Anthropic, Ollama, OpenAI-compatible, Mock) |
+| [`agents/`](maestro/agents)                | Pluggable backends (subscription CLIs, Ollama, OpenAI-compatible, Mock) |
 | [`orchestrator.py`](maestro/orchestrator.py)| The plan → execute → verify → escalate loop |
 | [`workspace.py`](maestro/workspace.py)     | Sandboxed search/replace edits |
 | [`verify.py`](maestro/verify.py)           | Runs check commands, returns compact reports |
 | [`ledger.py`](maestro/ledger.py)           | Transparent token accounting |
+
+## Safety
+
+- Agents work in **isolated copies**; the real repo is written once, at the end.
+- Only **source** comes back. Build output your check created (`.next/`, `dist/`,
+  `__pycache__`, …) stays in the copy — one ignore list governs copying in,
+  applying out, and cache fingerprinting, so they can't drift apart.
+- A winner that touched more than `MAESTRO_MAX_APPLY_FILES` (200) files is
+  refused outright rather than half-applied.
+- Every apply is **snapshotted first**: `maestro undo`.
 
 ## Tests
 
